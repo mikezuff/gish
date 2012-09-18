@@ -116,7 +116,7 @@ func getCachedRawExternals(cachePath string) (*bytes.Buffer, error) {
 		return nil, fmt.Errorf("Error opening externals cache: %v", err)
 	}
 
-	fmt.Printf("Reading cached externals from %s\n", cachePath)
+	// verbose? fmt.Printf("Reading cached externals from %s\n", cachePath)
 	rawExtern := new(bytes.Buffer)
 	_, err = rawExtern.ReadFrom(f)
 	if err != nil {
@@ -177,6 +177,7 @@ func getRawExternals(repoPath string) (string, error) {
 	}
 
 	// No cached externals found. Get them from git-svn.
+	fmt.Printf("Getting externals from server for: %s\n", repoPath)
 	rawExterns, err := gitSvnShowExternals(repoPath)
 	if err != nil {
 		return "", err
@@ -202,53 +203,43 @@ func ReadGitSvnRepo(repoPath string) (SvnRepoInfo, error) {
 }
 
 // Recursively clone or rebase externals within given git-svn repo.
-func CheckExternals(repoPath string) error {
-	externs, err := LoadExternals(repoPath)
+func UpdateExternals(repoPath string) error {
+	fmt.Printf("Rebasing %s:\n", repoPath)
+    err := interactiveShellCmd(repoPath, "git", "svn", "rebase")
+	if err != nil {
+		return err
+	}
+	/* TODO: We could check for changes to the externs. If so, invalidate the cache */
 
+	externs, err := LoadExternals(repoPath)
 	if err != nil {
 		return err
 	}
 
 	for _, extern := range externs {
-		if err != nil || DirIsExternCacheOnly(extern.Path) {
+        if IsRepo(extern.Path) {
+			// TODO: if the repo exists, make sure it matches the extern url. The extern may have been relocated.
+		} else if DirIsExternCacheOnly(extern.Path) {
 			fmt.Printf("Cloning external %s from %s\n", extern.Path, extern.Url)
 
 			// The directory doesn't exist, clone it.
 			// TODO: Clone args should be passed in or stored in a file
-			// TODO: encapsulate in gitSvnClone like the others?
 			err := interactiveShellCmd(repoPath, "git", "svn", "clone", "--no-minimize-url", extern.Url, extern.Path)
 			if err != nil {
 				return err
 			}
 
-			err = CheckExternals(extern.Path)
-			if err != nil {
-				return err
-			}
-
 		} else {
-			// TODO: if the repo exists, make sure it matches the extern url. The extern may have been relocated.
-			if IsRepo(extern.Path) {
-				fmt.Printf("NOT IMPLEMENTED: Rebasing external %s from %s\n",
-					extern.Path, extern.Url)
-				/* TODO: rebase
-				   err = gitSvnRebase()
-				   if err != nil {
-				       return err
-				   }
-				*/
-
-				err = CheckExternals(extern.Path)
-				if err != nil {
-					return err
-				}
-			} else {
-				return fmt.Errorf("Directory %s exists but is not git repo.", extern.Path)
-			}
+			return fmt.Errorf("Directory %s exists but is not git repo.", extern.Path)
 		}
-	}
 
-	fmt.Println("Done.")
+		// The extern is ready, check it.
+		err = UpdateExternals(extern.Path)
+		if err != nil {
+			return err
+		}
+
+	}
 
 	return nil
 }
@@ -369,15 +360,6 @@ func gitSvnShowExternals(repoPath string) (string, error) {
 	return interactiveShellCmdToString(repoPath, "git", "svn", "show-externals")
 }
 
-//func gitSvnClone(args...string) error {
-//_, err := shellCmd("git", []string{"svn", "clone", ...args})
-//return err
-//}
-
-func gitSvnRebase(repoPath string) error {
-	return fmt.Errorf("Unimplemented gitsvnrebase")
-}
-
 func gitSvnInfo(repoPath string) (info SvnRepoInfo, err error) {
 	out, err := shellCmd(repoPath, "git", "svn", "info")
 	if err != nil {
@@ -396,27 +378,6 @@ func gitSvnInfo(repoPath string) (info SvnRepoInfo, err error) {
 	return
 }
 
-func GitStatus(repo SvnRepoInfo) {
-	interactiveShellCmd(repo.Path, "git", "status")
-}
-
-func ForeachRepo(path string, action func(SvnRepoInfo)) error {
-	repoList, err := ReadFullGitSvnRepo(path)
-	if err != nil {
-		return err
-	}
-
-	if len(repoList) == 0 {
-		return fmt.Errorf("Path %s is not a git repo.\n", path)
-	}
-
-	for _, repo := range repoList {
-		action(repo)
-	}
-
-	return nil
-}
-
 // Split the src string by key:val, trimming whitespace off the value.
 // Return the value if the key == expectedKey, panic otherwise.
 func getValOrPanic(expectedKey string, src string) string {
@@ -429,10 +390,29 @@ func getValOrPanic(expectedKey string, src string) string {
 	return strings.TrimSpace(l[1])
 }
 
-type command struct {
-	name  string
-	usage string
-	impl  func()
+func MakeGitCommand(args []string) func(repo SvnRepoInfo) {
+	return func(repo SvnRepoInfo) {
+		interactiveShellCmd(repo.Path, "git", args...)
+	}
+}
+
+// Call the action function for each repo found in rootPath
+func ForeachRepo(rootPath string, action func(SvnRepoInfo)) error {
+	repoList, err := ReadFullGitSvnRepo(rootPath)
+	if err != nil {
+		return err
+	}
+
+	if len(repoList) == 0 {
+		return fmt.Errorf("Path %s is not a git repo.\n", rootPath)
+	}
+
+	for _, repo := range repoList {
+		fmt.Printf("Repo %s:\n", repo.Path)
+		action(repo)
+	}
+
+	return nil
 }
 
 func usage() {
@@ -442,8 +422,8 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "Usage:\n\t%s [options] <command>\n", cmdName)
 	fmt.Fprintf(os.Stderr, "Commands:\n")
 	fmt.Fprintf(os.Stderr, "\tlist: print all the known git-svn repos in this directory\n")
-	fmt.Fprintf(os.Stderr, "\tstatus: print the git status of each repo\n")
-	fmt.Fprintf(os.Stderr, "\tclone: checkout all the externals contained by the git-svn repo that the current directory is within\n")
+	fmt.Fprintf(os.Stderr, "\tupdate: clone/rebase all the externals contained by the git-svn repo\n")
+	fmt.Fprintf(os.Stderr, "\n\tOther commands are passed directly to git along with their arguments.\n")
 
 	fmt.Fprintf(os.Stderr, "Options:\n")
 	flag.PrintDefaults()
@@ -470,15 +450,8 @@ func main() {
 	}
 
 	switch args[0] {
-	case "status":
-		ForeachRepo(pwd, GitStatus)
-	case "clone":
-		// init+fetch+rebase
-		err = CheckExternals(pwd)
-	case "fetch":
-		log.Fatalf("Command %s not handled.", args[0])
-	case "rebase":
-		log.Fatalf("Command %s not handled.", args[0])
+	case "update":
+		err = UpdateExternals(pwd)
 	case "list":
 		repoList, err := ReadFullGitSvnRepo(pwd)
 		if err == nil {
@@ -488,7 +461,8 @@ func main() {
 			}
 		}
 	default:
-		log.Fatal("Unknown command: ", args[0])
+		// Simple recursive commands don't need any help.
+		err = ForeachRepo(pwd, MakeGitCommand(args))
 	}
 
 	if err != nil {
