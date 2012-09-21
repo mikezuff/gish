@@ -254,12 +254,12 @@ func ChanLoad(repoPath string, starts chan int, infoChan chan SvnRepoInfo) {
 	// Get svn info for the current directory
 	repoInfo, err := gitSvnInfo(repoPath)
 	if err != nil {
-		panic(err)
+        log.Fatal("Error getting svn info:", err)
 	}
 
 	externs, err := LoadExternals(repoPath)
 	if err != nil {
-		panic(err)
+        log.Fatal("Error loading externals:", err)
 	}
 
 	// Send the number of repo searches that will be started

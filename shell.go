@@ -24,6 +24,8 @@ Stdout is copied to a buffer which is returned as a string.
 
 TODO: This is meant to allow the user to authenticate with gitsvn. It should behave the same as git-svn by not echoing the password to the terminal. interactiveShellCmd behaves as expected, perhaps it could tee stdout??
 
+Try 'stty -echo'
+
 */
 func interactiveShellCmdToString(dir, arg0 string, args ...string) (string, error) {
 	cmd := exec.Command(arg0, args...)
