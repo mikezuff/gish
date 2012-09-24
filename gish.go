@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"runtime/pprof"
 	"strings"
 )
 
@@ -149,8 +150,8 @@ func getRawExternals(repoPath string) (string, error) {
 		return rawBytes.String(), nil
 	} else {
 		// No cache found, search for alternate cache if provided.
-		if alternateExternalsCache != "" {
-			alternateExternalsCachePath := path.Join(alternateExternalsCache, extCacheFilename)
+		if *alternateExternalsCache != "" {
+			alternateExternalsCachePath := path.Join(*alternateExternalsCache, extCacheFilename)
 			rawBytes, err = getCachedRawExternals(alternateExternalsCachePath)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error opening alt_cache: \n", err)
@@ -171,7 +172,7 @@ func getRawExternals(repoPath string) (string, error) {
 		}
 	}
 
-	if quickMode {
+	if *quickMode {
 		fmt.Printf("Quick mode: not reading externals for %s\n", repoPath)
 		return "", nil
 	}
@@ -205,7 +206,7 @@ func ReadGitSvnRepo(repoPath string) (SvnRepoInfo, error) {
 // Recursively clone or rebase externals within given git-svn repo.
 func UpdateExternals(repoPath string) error {
 	fmt.Printf("Rebasing %s:\n", repoPath)
-    err := interactiveShellCmd(repoPath, "git", "svn", "rebase")
+	err := interactiveShellCmd(repoPath, "git", "svn", "rebase")
 	if err != nil {
 		return err
 	}
@@ -217,7 +218,7 @@ func UpdateExternals(repoPath string) error {
 	}
 
 	for _, extern := range externs {
-        if IsRepo(extern.Path) {
+		if IsRepo(extern.Path) {
 			// TODO: if the repo exists, make sure it matches the extern url. The extern may have been relocated.
 		} else if DirIsExternCacheOnly(extern.Path) {
 			fmt.Printf("Cloning external %s from %s\n", extern.Path, extern.Url)
@@ -254,12 +255,12 @@ func ChanLoad(repoPath string, starts chan int, infoChan chan SvnRepoInfo) {
 	// Get svn info for the current directory
 	repoInfo, err := gitSvnInfo(repoPath)
 	if err != nil {
-        log.Fatal("Error getting svn info:", err)
+		log.Fatal("Error getting svn info:", err)
 	}
 
 	externs, err := LoadExternals(repoPath)
 	if err != nil {
-        log.Fatal("Error loading externals:", err)
+		log.Fatal("Error loading externals:", err)
 	}
 
 	// Send the number of repo searches that will be started
@@ -302,6 +303,8 @@ func LoadExternals(repoPath string) (externs []SvnRepoInfo, err error) {
 		return
 	}
 
+    // TODO: cache cooked externals.
+    // cookExternals is 58.6% of run time. 35% regex compile and 18% regex findstring
 	rawExterns, err := getRawExternals(repoPath)
 	if err == nil {
 		externs = cookExternals(repo, rawExterns)
@@ -429,14 +432,24 @@ func usage() {
 	flag.PrintDefaults()
 }
 
-var quickMode bool
-var alternateExternalsCache string
+var quickMode = flag.Bool("q", false, "Quick mode.")
+var alternateExternalsCache = flag.String("alt_ext_cache", "",
+	"Alternate path to search for externals cache file.")
+var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 
 func main() {
-	flag.BoolVar(&quickMode, "q", false, "Quick mode.")
-	flag.StringVar(&alternateExternalsCache, "alt_ext_cache", "",
-		"Alternate path to search for externals cache file.")
 	flag.Parse()
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer f.Close()
+
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 
 	args := flag.Args()
 	if len(args) == 0 {
@@ -453,7 +466,16 @@ func main() {
 	case "update":
 		err = UpdateExternals(pwd)
 	case "list":
-		repoList, err := ReadFullGitSvnRepo(pwd)
+        var repoList []SvnRepoInfo
+        var i int
+        if *cpuprofile != "" {
+            i = 1000
+        } else {
+            i = 1
+        }
+		for i = 0; i < 1; i++ {
+			repoList, err = ReadFullGitSvnRepo(pwd)
+		}
 		if err == nil {
 			fmt.Printf("Found %d repos:\n", len(repoList))
 			for _, repo := range repoList {
