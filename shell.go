@@ -58,6 +58,7 @@ func interactiveShellCmdToString(dir, arg0 string, args ...string) (string, erro
 // Execute the given command and return the output.
 func shellCmd(dir string, arg0 string, args ...string) (string, error) {
 	cmd := exec.Command(arg0, args...)
+    cmd.Dir = dir
 	cmd.Env = os.Environ()
 
 	stdout, err := cmd.StdoutPipe()

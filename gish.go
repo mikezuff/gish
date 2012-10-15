@@ -2,39 +2,46 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"log"
+	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
-	"runtime/pprof"
 	"strings"
 )
 
-// Replaces relative repo paths introduced in SVN 1.5.
-// ../ -- Relative to the URL of the directory on which the svn:externals property is set
-//  ^/ -- Relative to the root of the repository in which the svn:externals property is versioned
-//  // -- Relative to the scheme of the URL of the directory on which the svn:externals property is set
-//   / -- Relative to the root URL of the server on which the svn:externals property is versioned
-func ReplaceRelative(repoRoot, externalRef string) (string, error) {
-	refParts := strings.SplitAfterN(externalRef, "/", 2)
+const (
+	defaultCheckoutArgs = "--no-minimize-url"
 
-	switch refParts[0] {
-	case "^/":
-		return fmt.Sprint(repoRoot, "/", refParts[1]), nil
-	case "../":
-		fallthrough
-	case "//":
-		fallthrough
-	case "/":
-		return "", errors.New("Unhandled relative extern type")
-	}
+	cacheRelPath = ".git/info/gish.conf"
+	oldCachePath = "git_svn_externals"
+)
 
-	// No relative content
-	return externalRef, nil
+var (
+	altConfig = flag.String("c", "", "Path to config file to use if no other is found.")
+)
+
+func UsageExit(msg string) {
+	fmt.Fprintln(os.Stderr, msg)
+	Usage()
+	os.Exit(1)
+}
+
+func Usage() {
+	fmt.Fprint(os.Stderr, "gish - recursively perform commands on a git-svn repo and its externals\n")
+	fmt.Fprint(os.Stderr, "Usage:\n\tgish [options] <command>\n")
+	fmt.Fprint(os.Stderr, "Commands:\n")
+	fmt.Fprint(os.Stderr, "\tclone: clone the repo's externals.\n")
+	fmt.Fprint(os.Stderr, "\tlist: print all the known git-svn repos in this directory\n")
+	fmt.Fprint(os.Stderr, "\n\tOther commands are passed directly to git along with their arguments.\n")
+
+	fmt.Fprint(os.Stderr, "Options:\n")
+	flag.PrintDefaults()
 }
 
 // Returns true if the given directory is a git repository. (Contains a .git subdir)
@@ -48,273 +55,104 @@ func IsRepo(repoPath string) bool {
 	return info.IsDir()
 }
 
-// TODO: add this file and the extern dir to .gitignore
-const extCacheFilename = "git_svn_externals"
-
-// Returns true if the given path is a dir containing only an extern cache file
-func DirIsExternCacheOnly(repoPath string) bool {
-	info, err := os.Stat(repoPath)
-	if err != nil {
-		return false // Doesn't exist
-	}
-
-	if !info.IsDir() {
-		return false
-	}
-
-	dir, err := os.Open(repoPath)
+func IsDir(path string) bool {
+	info, err := os.Stat(path)
 	if err != nil {
 		return false
 	}
-	defer dir.Close()
+	return info.IsDir()
+}
 
-	files, err := dir.Readdirnames(4)
-	if len(files) < 1 || len(files) > 3 {
-		return false
+// Return the path to the outermost repo containing the current path.
+func FindRootRepoPath() (string, error) {
+	pwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error getting pwd: ", err)
+		os.Exit(1)
 	}
 
-	for _, fn := range files {
-		switch fn {
-		case ".":
-		case "..":
-		case extCacheFilename:
-			// these are acceptable
-		default:
-			return false
+	// XXX: non-portable
+	parts := strings.SplitAfter(pwd, "/")
+	for i, _ := range parts {
+		testPath := path.Join(parts[:i+1]...)
+		if IsRepo(testPath) {
+			return testPath, nil
 		}
 	}
 
-	return true
-
+	// Return pwd in case we're cloning into pwd.
+	return pwd, fmt.Errorf("No .git found in %s or any parent dir.", pwd)
 }
 
-type SvnRepoInfo struct {
-	Path           string
-	Url            string
-	RepositoryRoot string
-	//RepositoryUuid string
-	//Revision int
-	//NodeKind string
-	//Schedule string
-	//LastChangedAuthor string
-	//LastChangedRevision int
-	//LastChangedDate string
+func SvnRoot(svnUrl string) string {
+    u,err := url.Parse(svnUrl)
+    if err != nil {
+        return ""
+    }
+
+    // Chop all but the root path
+    u.Path = strings.SplitAfterN(u.Path, "/", 2)[0]
+    return u.String()
 }
 
-func getCachedRawExternals(cachePath string) (*bytes.Buffer, error) {
+// Replaces relative repo paths introduced in SVN 1.5.
+// ../ -- Relative to the URL of the directory on which the svn:externals property is set
+//  ^/ -- Relative to the root of the repository in which the svn:externals property is versioned
+//  // -- Relative to the scheme of the URL of the directory on which the svn:externals property is set
+//   / -- Relative to the root URL of the server on which the svn:externals property is versioned
+func ReplaceRelative(repoRootUrl, externalRef string) (string, error) {
+	refParts := strings.SplitAfterN(externalRef, "/", 2)
 
-	// Test for cache file
-	fi, err := os.Stat(cachePath)
-	if err != nil {
-		return nil, err
-	} else if fi.IsDir() {
-		return nil, fmt.Errorf("Error %s is not an externals cache file", cachePath)
+	switch refParts[0] {
+	case "^/":
+		return fmt.Sprint(repoRootUrl, "/", refParts[1]), nil
+	case "../":
+		fallthrough
+	case "//":
+		fallthrough
+	case "/":
+		return "", errors.New("Unhandled relative extern type")
 	}
 
-	// TODO: there's a library io or ioutil that reads from file to buffer
-	f, err := os.Open(cachePath)
-	if err != nil {
-		return nil, fmt.Errorf("Error opening externals cache: %v", err)
-	}
-
-	// verbose? fmt.Printf("Reading cached externals from %s\n", cachePath)
-	rawExtern := new(bytes.Buffer)
-	_, err = rawExtern.ReadFrom(f)
-	if err != nil {
-		return nil, fmt.Errorf("Error reading externals cache: %v", err)
-	}
-
-	return rawExtern, nil
+	// No relative content
+	return externalRef, nil
 }
 
-func cacheRawExternals(cachePath, rawExterns string) {
-	f, err := os.Create(cachePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failure opening cache file %s", cachePath)
-		return
-	}
-
-	_, err = f.WriteString(rawExterns)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failure writing cache file %s", cachePath)
-	}
-}
-
-func getRawExternals(repoPath string) (string, error) {
-	cachePath := path.Join(repoPath, extCacheFilename)
-
-	// TODO: accept arg to force cache refresh
-
-	rawBytes, err := getCachedRawExternals(cachePath)
-	if err == nil {
-		return rawBytes.String(), nil
-	} else {
-		// No cache found, search for alternate cache if provided.
-		if *alternateExternalsCache != "" {
-			alternateExternalsCachePath := path.Join(*alternateExternalsCache, extCacheFilename)
-			rawBytes, err = getCachedRawExternals(alternateExternalsCachePath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error opening alt_cache: \n", err)
-			} else {
-				// Alt cache is good, copy it to the current dir
-				err = os.MkdirAll(path.Dir(alternateExternalsCachePath), 0660)
-				if err == nil {
-					err = ioutil.WriteFile(alternateExternalsCachePath, rawBytes.Bytes(), 0660)
-				}
-
-				if err == nil {
-					fmt.Printf("Externals copied from alt cache to %s\n", alternateExternalsCachePath)
-					return rawBytes.String(), nil
-				} else {
-					fmt.Fprintf(os.Stderr, "Error storing alt_cache to %s: %s", alternateExternalsCachePath, err)
-				}
-			}
-		}
-	}
-
-	if *quickMode {
-		fmt.Printf("Quick mode: not reading externals for %s\n", repoPath)
-		return "", nil
-	}
-
-	// No cached externals found. Get them from git-svn.
-	fmt.Printf("Getting externals from server for: %s\n", repoPath)
-	rawExterns, err := gitSvnShowExternals(repoPath)
+func GitSvnUrl(repoPath string) (url string, err error) {
+	out, err := shellCmd(repoPath, "git", "svn", "info")
 	if err != nil {
 		return "", err
 	}
 
-	cacheRawExternals(cachePath, rawExterns)
-
-	return rawExterns, nil
+	lines := strings.SplitAfter(out, "\n")
+	for _, line := range lines {
+		w := strings.SplitN(line, ":", 2)
+		if w[0] == "URL" {
+			return w[1], nil
+		}
+	}
+	return "", fmt.Errorf("Attribute URL not found in git svn info for %s", repoPath)
 }
 
-// Return a SvnRepoInfo for the git-svn repo in the current directory.
-func ReadGitSvnRepo(repoPath string) (SvnRepoInfo, error) {
-	if !IsRepo(repoPath) {
-		return SvnRepoInfo{}, fmt.Errorf("Path %s is not a git-svn repo.", repoPath)
-	}
-
-	svnrepo, err := gitSvnInfo(repoPath)
-	if err != nil {
-		return SvnRepoInfo{}, err
-	}
-
-	return svnrepo, nil
+type Repo struct {
+	Path           string
+	Url            string
+	CheckoutArgs   string
+	ExternalsKnown bool
+	Externals      []Repo
+	Root           *Repo `json:"-"` // Don't include in json
 }
 
-// Recursively clone or rebase externals within given git-svn repo.
-func UpdateExternals(repoPath string) error {
-	fmt.Printf("Rebasing %s:\n", repoPath)
-	err := interactiveShellCmd(repoPath, "git", "svn", "rebase")
-	if err != nil {
-		return err
-	}
-	/* TODO: We could check for changes to the externs. If so, invalidate the cache */
-
-	externs, err := LoadExternals(repoPath)
+func (repo *Repo) LoadExternals() error {
+	rawExternals, err := interactiveShellCmdToString(repo.Path, "git", "svn", "show-externals")
 	if err != nil {
 		return err
 	}
 
-	for _, extern := range externs {
-		if IsRepo(extern.Path) {
-			// TODO: if the repo exists, make sure it matches the extern url. The extern may have been relocated.
-		} else if DirIsExternCacheOnly(extern.Path) {
-			fmt.Printf("Cloning external %s from %s\n", extern.Path, extern.Url)
-
-			// The directory doesn't exist, clone it.
-			// TODO: Clone args should be passed in or stored in a file
-			err := interactiveShellCmd(repoPath, "git", "svn", "clone", "--no-minimize-url", extern.Url, extern.Path)
-			if err != nil {
-				return err
-			}
-
-		} else {
-			return fmt.Errorf("Directory %s exists but is not git repo.", extern.Path)
-		}
-
-		// The extern is ready, check it.
-		err = UpdateExternals(extern.Path)
-		if err != nil {
-			return err
-		}
-
-	}
-
-	return nil
+	return repo.CookExternals(rawExternals)
 }
 
-func ChanLoad(repoPath string, starts chan int, infoChan chan SvnRepoInfo) {
-	if !IsRepo(repoPath) {
-		fmt.Printf("IGNORED: Path %s is not a git-svn repo.\n", repoPath)
-		starts <- -1 // We're not going to put an infoChan for this repo
-		return
-	}
-
-	// Get svn info for the current directory
-	repoInfo, err := gitSvnInfo(repoPath)
-	if err != nil {
-		log.Fatal("Error getting svn info:", err)
-	}
-
-	externs, err := LoadExternals(repoPath)
-	if err != nil {
-		log.Fatal("Error loading externals:", err)
-	}
-
-	// Send the number of repo searches that will be started
-	starts <- len(externs)
-
-	for _, extern := range externs {
-		go ChanLoad(extern.Path, starts, infoChan)
-	}
-
-	infoChan <- repoInfo
-}
-
-// Load the svn info for the git-svn repo in the given directory and all known
-// externals. 
-func ReadFullGitSvnRepo(repoPath string) (repoList []SvnRepoInfo, err error) {
-
-	infoChan := make(chan SvnRepoInfo)
-	starts := make(chan int)
-	go ChanLoad(repoPath, starts, infoChan)
-
-	rx := 1 + <-starts
-
-	for rx > 0 {
-		select {
-		case n := <-starts:
-			rx += n
-		case info := <-infoChan:
-			repoList = append(repoList, info)
-			rx--
-		}
-	}
-
-	return
-}
-
-func LoadExternals(repoPath string) (externs []SvnRepoInfo, err error) {
-	repo, err := ReadGitSvnRepo(repoPath)
-	if err != nil {
-		err = fmt.Errorf("Error %v, loading %v", err, repoPath)
-		return
-	}
-
-    // TODO: cache cooked externals.
-    // cookExternals is 58.6% of run time. 35% regex compile and 18% regex findstring
-	rawExterns, err := getRawExternals(repoPath)
-	if err == nil {
-		externs = cookExternals(repo, rawExterns)
-	}
-
-	return
-}
-
-func cookExternals(parent SvnRepoInfo, rawExternals string) (cooked []SvnRepoInfo) {
-	i := 0
+func (repo *Repo) CookExternals(rawExternals string) error {
 
 	const (
 		PATH = iota
@@ -323,7 +161,6 @@ func cookExternals(parent SvnRepoInfo, rawExternals string) (cooked []SvnRepoInf
 
 	var lastPath []string
 	pathRegex := regexp.MustCompile(`^#\s(.*)`)
-
 	lines := strings.SplitAfter(rawExternals, "\n")
 	expecting := PATH
 	for _, line := range lines {
@@ -331,163 +168,391 @@ func cookExternals(parent SvnRepoInfo, rawExternals string) (cooked []SvnRepoInf
 			lastPath = pathRegex.FindStringSubmatch(line)
 			if lastPath != nil {
 				expecting = EXT
-				//fmt.Printf("PATH matched %s\n", lastPath[1])
 			} else {
-				//fmt.Printf("PATH Ignoring line %s\n", strings.TrimSpace(line))
 			}
 		} else if expecting == EXT {
 			pat := fmt.Sprintf(`^%s(\S*)\s(.*)`, regexp.QuoteMeta(lastPath[1]))
 			extRegex := regexp.MustCompile(pat)
 			match := extRegex.FindStringSubmatch(line)
-			if match == nil {
-				//fmt.Printf("EXT Ignoring line %s\n", strings.TrimSpace(line))
-			} else {
-				svnUrl, err := ReplaceRelative(parent.RepositoryRoot, match[1])
+			if match != nil {
+				svnUrl, err := ReplaceRelative(repo.Url, match[1])
 				if err != nil {
-					fmt.Errorf("Error with extern %v\n", err)
+					return fmt.Errorf("Error with extern %v\n", err)
 				} else {
-					extPath := path.Join(parent.Path, lastPath[1], match[2])
-					cooked = append(cooked, SvnRepoInfo{Path: extPath, Url: svnUrl})
-					//fmt.Printf("New external: %s => %s\n", extPath, svnUrl)
+					extPath := path.Join(repo.Path, lastPath[1], match[2])
+					repo.Externals = append(repo.Externals,
+						Repo{Path: extPath, Url: svnUrl, Root: repo.Root})
 				}
 			}
 			expecting = PATH
 		}
-		i += 1
 	}
 
-	return cooked
+	repo.ExternalsKnown = true
+	return nil
 }
 
-func gitSvnShowExternals(repoPath string) (string, error) {
-	return interactiveShellCmdToString(repoPath, "git", "svn", "show-externals")
-}
-
-func gitSvnInfo(repoPath string) (info SvnRepoInfo, err error) {
-	out, err := shellCmd(repoPath, "git", "svn", "info")
-	if err != nil {
-		return
-	}
-
-	attrs := strings.SplitAfter(out, "\n")
-
-	// The path given by svn info is relative to the current directory
-	// so it's always '.' :(
-	//info.Path = getValOrPanic("Path", attrs[0])
-	info.Path = repoPath
-	info.Url = getValOrPanic("URL", attrs[1])
-	info.RepositoryRoot = getValOrPanic("Repository Root", attrs[2])
-
-	return
-}
-
-// Split the src string by key:val, trimming whitespace off the value.
-// Return the value if the key == expectedKey, panic otherwise.
-func getValOrPanic(expectedKey string, src string) string {
-	l := strings.SplitN(src, ":", 2)
-
-	if l[0] != expectedKey {
-		panic(fmt.Sprintf("Key %s doesn't match expected key %s", l[0], expectedKey))
-	}
-
-	return strings.TrimSpace(l[1])
-}
-
-func MakeGitCommand(args []string) func(repo SvnRepoInfo) {
-	return func(repo SvnRepoInfo) {
-		interactiveShellCmd(repo.Path, "git", args...)
+func (repo *Repo) List() {
+	fmt.Println(repo.Path)
+	for _, ext := range repo.Externals {
+		ext.List()
 	}
 }
 
-// Call the action function for each repo found in rootPath
-func ForeachRepo(rootPath string, action func(SvnRepoInfo)) error {
-	repoList, err := ReadFullGitSvnRepo(rootPath)
-	if err != nil {
-		return err
+// Return a slice of the paths of the repo and all its externs
+func (repo *Repo) Paths() []string {
+	p := []string{repo.Path}
+	for _, ext := range repo.Externals {
+		p = append(p, ext.Paths()...)
 	}
 
-	if len(repoList) == 0 {
-		return fmt.Errorf("Path %s is not a git repo.\n", rootPath)
+	return p
+}
+
+// Link externals to a root repo
+func LinkTo(externs []Repo, root *Repo) {
+	for i := range externs {
+		externs[i].Root = root
+		LinkTo(externs[i].Externals, root)
+	}
+}
+
+// Link Root of all child repos to this repo
+func (repo *Repo) LinkRoot() {
+	LinkTo(repo.Externals, repo)
+}
+
+func RewritePaths(repo *Repo, a, b string) {
+	repo.Path = strings.Replace(repo.Path, a, b, 1)
+	for i := range repo.Externals {
+		RewritePaths(&repo.Externals[i], a, b)
+	}
+}
+
+// Check that the repo and its externals are cloned.
+func (repo *Repo) Clone() error {
+	repoPath, repoDir := path.Split(repo.Path)
+
+	if IsRepo(repo.Path) {
+		fmt.Printf("Path %s is a repo, updating from svn.\n", repo.Path)
+		err := interactiveShellCmd(repo.Path, "git", "svn", "rebase")
+		if err != nil {
+			return err
+		}
+	} else {
+		fmt.Printf("Cloning %q from svn url %q\n", repo.Path, repo.Url)
+
+        err := os.MkdirAll(repo.Path, 0770)
+        if err != nil {
+            return err
+        }
+
+		args := []string{"svn", "clone"}
+		if repo.CheckoutArgs != "" {
+			args = append(args, strings.Split(repo.CheckoutArgs, " ")...)
+		} else {
+			args = append(args, defaultCheckoutArgs)
+		}
+		args = append(args, repo.Url, repoDir)
+        fmt.Printf("> git %v\n", args)
+        err = interactiveShellCmd(repoPath, "git", args...)
+		if err != nil {
+			return err
+		}
 	}
 
-	for _, repo := range repoList {
-		fmt.Printf("Repo %s:\n", repo.Path)
-		action(repo)
+	if !repo.ExternalsKnown {
+		err := repo.LoadExternals()
+		if err != nil {
+			return err
+		}
+	}
+
+	// Save the externals
+	repo.WriteConfig()
+
+	for i := range repo.Externals {
+		err := repo.Externals[i].Clone()
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func usage() {
-	cmdName := "gish" // Not: os.Args[0]
-	fmt.Fprintf(os.Stderr, "%s - recursively perform commands on a git-svn repo and its externals\n",
-		cmdName)
-	fmt.Fprintf(os.Stderr, "Usage:\n\t%s [options] <command>\n", cmdName)
-	fmt.Fprintf(os.Stderr, "Commands:\n")
-	fmt.Fprintf(os.Stderr, "\tlist: print all the known git-svn repos in this directory\n")
-	fmt.Fprintf(os.Stderr, "\tupdate: clone/rebase all the externals contained by the git-svn repo\n")
-	fmt.Fprintf(os.Stderr, "\n\tOther commands are passed directly to git along with their arguments.\n")
+// Do a 'git clean' on each repo, removing the externals from the list.
+func (repo *Repo) Clean() error {
+	toRmStr, err := shellCmd(repo.Path, "git", "clean", "-ndx")
+	if err != nil {
+		return err
+	}
 
-	fmt.Fprintf(os.Stderr, "Options:\n")
-	flag.PrintDefaults()
+    // Build a map of the externs
+    extMap := make(map[string]bool, len(repo.Externals))
+    for _, ext := range repo.Externals {
+        extRelPath := strings.Trim(strings.Replace(ext.Path, repo.Path, "", 1), "/")
+        extMap[extRelPath] = true
+    }
+
+    toRm := strings.Split(toRmStr, "\n")
+    for i := range toRm {
+        r := strings.Replace(toRm[i], "Would remove ", "", 1)
+        r = strings.Trim(r, "/")
+
+        if r == "" {
+            continue
+        }
+
+        qualifiedR := path.Join(repo.Path, r)
+
+        if !extMap[r] {
+            enable := true // TODO: flag
+            if enable {
+                err = os.RemoveAll(qualifiedR)
+                if err != nil {
+                    fmt.Fprintln(os.Stdout, err)
+                }
+            } else {
+                fmt.Printf("Would remove %q\n", qualifiedR)
+            }
+        } else {
+            fmt.Printf("Ignoring external at %q\n", qualifiedR)
+        }
+    }
+
+
+    for _, ext := range repo.Externals {
+        err = ext.Clean()
+        if err != nil {
+            return err
+        }
+    }
+
+    return nil
 }
 
-var quickMode = flag.Bool("q", false, "Quick mode.")
-var alternateExternalsCache = flag.String("alt_ext_cache", "",
-	"Alternate path to search for externals cache file.")
-var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+// Load the old-style externals cache into the repo.
+// repo.Path should be initialized beforehand.
+func (repo *Repo) ConvertExternCache() error {
+	fullCachePath := path.Join(repo.Path, oldCachePath)
+	b, err := ioutil.ReadFile(fullCachePath)
+	if err != nil {
+		return err
+	}
+
+	repo.Url, err = GitSvnUrl(repo.Path)
+	if err != nil {
+		return err
+	}
+
+	buf := bytes.NewBuffer(b)
+	err = repo.CookExternals(buf.String())
+	if err != nil {
+		return err
+	} else {
+		// TODO: why is extern a copy in
+		// for  _, extern := range repo.externals
+		for i := range repo.Externals {
+			err = repo.Externals[i].ConvertExternCache()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error converting old cache: ", err)
+			}
+		}
+	}
+
+	err = os.Remove(fullCachePath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error deleting old cache: ", err)
+	}
+
+	return nil
+}
+
+// If necessary, write the repo configuration to file.
+func (repo *Repo) WriteConfig() error {
+	if repo.Root != nil {
+		return repo.Root.WriteConfig()
+	} else {
+		b, err := json.MarshalIndent(repo, "", "  ")
+		if err != nil {
+			return err
+		}
+
+		return ioutil.WriteFile(path.Join(repo.Path, cacheRelPath), b, 0660)
+	}
+	panic("Unreachable")
+}
+
+// Create a Repo from a config file at the given location.
+// Location can be a path to a git repo or to a config file.
+func LoadConfig(repoPath string) (repo *Repo, err error) {
+	isDir := IsDir(repoPath)
+	cachePath := repoPath
+	if isDir {
+		cachePath = path.Join(repoPath, cacheRelPath)
+	}
+
+	// Look for new config
+	b, err := ioutil.ReadFile(cachePath)
+	if err == nil {
+		repo = new(Repo)
+		err = json.Unmarshal(b, repo)
+	} else {
+		// Look for old externals cache
+		if isDir {
+			cachePath = path.Join(repoPath, oldCachePath)
+		}
+		_, err = os.Stat(cachePath)
+		if err == nil {
+			repo := &Repo{Path: repoPath}
+			err = repo.ConvertExternCache()
+		} else {
+			err = fmt.Errorf("No config found in %s", repoPath)
+		}
+	}
+
+	if repo != nil {
+		repo.LinkRoot()
+	}
+
+	return repo, err
+}
+
+// TODO: use cases handled?
+// gish use cases:
+// * completely new, no config
+//       gish clone svn://svnserver/repo [destdir]
+// * alt config
+//    1) Completely new
+//       gish clone --config=alt [destdir]
+//    2) Existing repo (any command).
+//       gish --config=alt [command]
+//       -- Check urls against repo
+//       -- Assume externs are right??
+// * Clone of root, no config
+// TODO: Clone of existing git-svn repo?
+func NewRepo(cmdLineArgs []string) (*Repo, error) {
+	rootPath, err := FindRootRepoPath()
+	if err != nil {
+		if cmdLineArgs[0] == "clone" {
+			// Clone can be used three ways, two are handled here
+			if *altConfig != "" {
+				// Usage is:  gish clone --config=alt destdir
+				if len(cmdLineArgs) != 2 {
+					UsageExit("Invalid args to 'gish clone'.")
+				}
+
+				destDir, err := filepath.Abs(cmdLineArgs[1])
+				if err != nil {
+					UsageExit(fmt.Sprintf("invalid destdir %s: %v", cmdLineArgs[1], err))
+				}
+
+				repo, err := LoadConfig(*altConfig)
+				if err != nil {
+					fmt.Fprintln(os.Stderr,
+						"Provided alternate config is invalid: ", err.Error())
+					os.Exit(1)
+				}
+
+				RewritePaths(repo, repo.Path, destDir)
+				return repo, nil
+			} else {
+				// TODO: is this usage documented?
+				// TODO: do both w/ and w/o destdir work?
+				// Usage is:  gish clone svn://svnserver/repo [destdir]
+
+				if len(cmdLineArgs) < 2 {
+					UsageExit("Not enough arguments to 'gish clone'.")
+				}
+
+				// Fill in the url provided, clone will fill the rest
+				svnUrl, err := url.Parse(strings.TrimSpace(cmdLineArgs[1]))
+				if err != nil {
+					UsageExit(fmt.Sprint("Error parsing svn Url: %q", err.Error()))
+				}
+
+				var destDir string
+				if len(cmdLineArgs) == 3 {
+					destDir = cmdLineArgs[2]
+				} else {
+					pathParts := strings.Split(svnUrl.Path, "/")
+					destDir = pathParts[len(pathParts)-1]
+				}
+
+				absDestDir, err := filepath.Abs(destDir)
+				if err != nil {
+					UsageExit(fmt.Sprintf("invalid destdir %s: %v", destDir, err))
+				}
+
+				return &Repo{Path: absDestDir, Url: svnUrl.String()}, nil
+			}
+		} else {
+			return nil, err
+		}
+	}
+
+	repo, err := LoadConfig(rootPath)
+	if err != nil {
+		fmt.Println(err)
+		fmt.Printf("Loading info from git. This may take a while.\n")
+		url, err := GitSvnUrl(rootPath)
+		if err != nil {
+			return nil, err
+		}
+
+		repo := &Repo{Path: rootPath, Url: url}
+
+		err = repo.LoadExternals()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return repo, nil
+}
 
 func main() {
 	flag.Parse()
 
-	if *cpuprofile != "" {
-		f, err := os.Create(*cpuprofile)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer f.Close()
-
-		pprof.StartCPUProfile(f)
-		defer pprof.StopCPUProfile()
+	cmdLineArgs := flag.Args()
+	if len(cmdLineArgs) == 0 {
+		UsageExit("No command provided.")
 	}
 
-	args := flag.Args()
-	if len(args) == 0 {
-		usage()
-		log.Fatal("No command provided.")
-	}
-
-	pwd, err := os.Getwd()
+	repo, err := NewRepo(cmdLineArgs)
 	if err != nil {
-		log.Fatal("Error getting pwd: ", err)
+		fmt.Println(err)
+		os.Exit(1)
 	}
 
-	switch args[0] {
-	case "update":
-		err = UpdateExternals(pwd)
-	case "list":
-        var repoList []SvnRepoInfo
-        var i int
-        if *cpuprofile != "" {
-            i = 1000
-        } else {
-            i = 1
-        }
-		for i = 0; i < 1; i++ {
-			repoList, err = ReadFullGitSvnRepo(pwd)
+	// TODO: add externs to .git/info/exclude
+
+	switch cmdLineArgs[0] {
+	case "clone":
+		err = repo.Clone()
+		if err != nil { // Skip the config write. Clone() writes config for each successful clone.
+			fmt.Println(err)
+			os.Exit(1)
 		}
-		if err == nil {
-			fmt.Printf("Found %d repos:\n", len(repoList))
-			for _, repo := range repoList {
-				fmt.Println(repo.Path)
+	case "list":
+		repo.List()
+    case "clean":
+        repo.Clean()
+	default:
+		paths := repo.Paths()
+		for _, path := range paths {
+			fmt.Printf("Repo %s:\n", path)
+			err = interactiveShellCmd(path, "git", cmdLineArgs...)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Git returned error:", err)
+				// Don't quit, commands that get paged will return error.
 			}
 		}
-	default:
-		// Simple recursive commands don't need any help.
-		err = ForeachRepo(pwd, MakeGitCommand(args))
 	}
 
+	err = repo.WriteConfig()
 	if err != nil {
-		log.Fatal("Error: ", err)
+		fmt.Fprintln(os.Stderr, "Error writing config: ", err)
 	}
 }
