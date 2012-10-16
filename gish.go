@@ -504,23 +504,26 @@ func NewRepo(cmdLineArgs []string) (*Repo, error) {
 	}
 
 	repo, err := LoadConfig(rootPath)
-	if err != nil {
-		fmt.Println(err)
-		fmt.Printf("Loading info from git. This may take a while.\n")
-		url, err := GitSvnInfo(rootPath, "URL")
-		if err != nil {
-			return nil, err
-		}
-
-		repo := &Repo{Path: rootPath, Url: url}
-
-		err = repo.LoadExternals()
-		if err != nil {
-			return nil, err
-		}
+	if err == nil {
+		return repo, nil
 	}
 
-	return repo, nil
+	// LoadConfig failed, create a repo from git
+	fmt.Println(err)
+	fmt.Printf("Loading info from git. This may take a while.\n")
+	url, err := GitSvnInfo(rootPath, "URL")
+	if err != nil {
+		return nil, err
+	}
+
+	repo = &Repo{Path: rootPath, Url: url}
+
+	err = repo.LoadExternals()
+	if err != nil {
+		return nil, err
+	}
+
+    return repo, nil
 }
 
 func main() {
