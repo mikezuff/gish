@@ -84,15 +84,22 @@ func FindRootRepoPath() (string, error) {
 	return pwd, fmt.Errorf("No .git found in %s or any parent dir.", pwd)
 }
 
-func SvnRoot(svnUrl string) string {
-    u,err := url.Parse(svnUrl)
-    if err != nil {
-        return ""
-    }
+// Get svn info for the repo. Label is the string to the left of the colon in the 
+// standard svn info format. RepoPath must be a git-svn repo.
+func GitSvnInfo(repoPath, label string) (string, error) {
+	out, err := shellCmd(repoPath, "git", "svn", "info")
+	if err != nil {
+		return "", fmt.Errorf("git svn info failed (%s), not a git repo??\n", err)
+	}
 
-    // Chop all but the root path
-    u.Path = strings.SplitAfterN(u.Path, "/", 2)[0]
-    return u.String()
+	lines := strings.SplitAfter(out, "\n")
+	for _, line := range lines {
+		w := strings.SplitN(line, ":", 2)
+		if w[0] == label {
+			return strings.TrimSpace(w[1]), nil
+		}
+	}
+	return "", fmt.Errorf("attribute %s not found in git svn info", label)
 }
 
 // Replaces relative repo paths introduced in SVN 1.5.
@@ -175,7 +182,12 @@ func (repo *Repo) CookExternals(rawExternals string) error {
 			extRegex := regexp.MustCompile(pat)
 			match := extRegex.FindStringSubmatch(line)
 			if match != nil {
-				svnUrl, err := ReplaceRelative(repo.Url, match[1])
+				repoRoot, err := GitSvnInfo(repo.Path, "Repository Root")
+				if err != nil {
+					return err
+				}
+
+				svnUrl, err := ReplaceRelative(repoRoot, match[1])
 				if err != nil {
 					return fmt.Errorf("Error with extern %v\n", err)
 				} else {
@@ -242,10 +254,10 @@ func (repo *Repo) Clone() error {
 	} else {
 		fmt.Printf("Cloning %q from svn url %q\n", repo.Path, repo.Url)
 
-        err := os.MkdirAll(repo.Path, 0770)
-        if err != nil {
-            return err
-        }
+		err := os.MkdirAll(repo.Path, 0770)
+		if err != nil {
+			return err
+		}
 
 		args := []string{"svn", "clone"}
 		if repo.CheckoutArgs != "" {
@@ -254,8 +266,8 @@ func (repo *Repo) Clone() error {
 			args = append(args, defaultCheckoutArgs)
 		}
 		args = append(args, repo.Url, repoDir)
-        fmt.Printf("> git %v\n", args)
-        err = interactiveShellCmd(repoPath, "git", args...)
+		fmt.Printf("> git %v\n", args)
+		err = interactiveShellCmd(repoPath, "git", args...)
 		if err != nil {
 			return err
 		}
@@ -288,48 +300,47 @@ func (repo *Repo) Clean() error {
 		return err
 	}
 
-    // Build a map of the externs
-    extMap := make(map[string]bool, len(repo.Externals))
-    for _, ext := range repo.Externals {
-        extRelPath := strings.Trim(strings.Replace(ext.Path, repo.Path, "", 1), "/")
-        extMap[extRelPath] = true
-    }
+	// Build a map of the externs
+	extMap := make(map[string]bool, len(repo.Externals))
+	for _, ext := range repo.Externals {
+		extRelPath := strings.Trim(strings.Replace(ext.Path, repo.Path, "", 1), "/")
+		extMap[extRelPath] = true
+	}
 
-    toRm := strings.Split(toRmStr, "\n")
-    for i := range toRm {
-        r := strings.Replace(toRm[i], "Would remove ", "", 1)
-        r = strings.Trim(r, "/")
+	toRm := strings.Split(toRmStr, "\n")
+	for i := range toRm {
+		r := strings.Replace(toRm[i], "Would remove ", "", 1)
+		r = strings.Trim(r, "/")
 
-        if r == "" {
-            continue
-        }
+		if r == "" {
+			continue
+		}
 
-        qualifiedR := path.Join(repo.Path, r)
+		qualifiedR := path.Join(repo.Path, r)
 
-        if !extMap[r] {
-            enable := true // TODO: flag
-            if enable {
-                err = os.RemoveAll(qualifiedR)
-                if err != nil {
-                    fmt.Fprintln(os.Stdout, err)
-                }
-            } else {
-                fmt.Printf("Would remove %q\n", qualifiedR)
-            }
-        } else {
-            fmt.Printf("Ignoring external at %q\n", qualifiedR)
-        }
-    }
+		if !extMap[r] {
+			enable := true // TODO: flag
+			if enable {
+				err = os.RemoveAll(qualifiedR)
+				if err != nil {
+					fmt.Fprintln(os.Stdout, err)
+				}
+			} else {
+				fmt.Printf("Would remove %q\n", qualifiedR)
+			}
+		} else {
+			fmt.Printf("Ignoring external at %q\n", qualifiedR)
+		}
+	}
 
+	for _, ext := range repo.Externals {
+		err = ext.Clean()
+		if err != nil {
+			return err
+		}
+	}
 
-    for _, ext := range repo.Externals {
-        err = ext.Clean()
-        if err != nil {
-            return err
-        }
-    }
-
-    return nil
+	return nil
 }
 
 // Load the old-style externals cache into the repo.
@@ -341,7 +352,7 @@ func (repo *Repo) ConvertExternCache() error {
 		return err
 	}
 
-	repo.Url, err = GitSvnUrl(repo.Path)
+	repo.Url, err = GitSvnInfo(repo.Path, "URL")
 	if err != nil {
 		return err
 	}
@@ -496,7 +507,7 @@ func NewRepo(cmdLineArgs []string) (*Repo, error) {
 	if err != nil {
 		fmt.Println(err)
 		fmt.Printf("Loading info from git. This may take a while.\n")
-		url, err := GitSvnUrl(rootPath)
+		url, err := GitSvnInfo(rootPath, "URL")
 		if err != nil {
 			return nil, err
 		}
@@ -537,8 +548,8 @@ func main() {
 		}
 	case "list":
 		repo.List()
-    case "clean":
-        repo.Clean()
+	case "clean":
+		repo.Clean()
 	default:
 		paths := repo.Paths()
 		for _, path := range paths {
