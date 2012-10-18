@@ -24,6 +24,10 @@ const (
 
 var (
 	altConfig = flag.String("c", "", "Path to config file to use if no other is found.")
+    // TODO: these options only mean anything to 'gish clean' it doesn't make sense that they must be
+    // provided prior to the 'clean' command. Use flag subsets to find flags following 'clean'
+    dryRun = flag.Bool("n", false, "If used with clean, list files that would be removed.")
+    force = flag.Bool("f", false, "If used with clean, enable removing files. Like git, -n or -f is required for clean.")
 )
 
 func UsageExit(msg string) {
@@ -295,6 +299,10 @@ func (repo *Repo) Clone() error {
 
 // Do a 'git clean' on each repo, removing the externals from the list.
 func (repo *Repo) Clean() error {
+    if !*force && !*dryRun {
+        UsageExit("-n or -f required for clean.")
+    }
+
 	toRmStr, err := shellCmd(repo.Path, "git", "clean", "-ndx")
 	if err != nil {
 		return err
@@ -319,8 +327,7 @@ func (repo *Repo) Clean() error {
 		qualifiedR := path.Join(repo.Path, r)
 
 		if !extMap[r] {
-			enable := true // TODO: flag
-			if enable {
+			if !*dryRun {
 				err = os.RemoveAll(qualifiedR)
 				if err != nil {
 					fmt.Fprintln(os.Stdout, err)
