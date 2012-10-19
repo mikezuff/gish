@@ -10,6 +10,17 @@ Capabilities
 
 Usage
 -----
+
+### Clone
+Clone the svn repo.
+* gish clone svn://svnserver/repo/path [destDir]
+
+Use a preexisting config file to create a new repo. This avoids fetching the externals from the svn server.
+* gish clone -c=gish.conf destdir
+
+### Clean
+Remove all untracked files. -n lists files that would be removed, -f enables removal. One flag must be provided.
+
 Clone the root repo manually. Within that repo, `gish update` will recursively clone the externals. Normal git commands are performed on the root repo and all externals, recursively. For example, `gish status -uno` will show the status for all the repos, hiding the untracked files.
 
 Installation

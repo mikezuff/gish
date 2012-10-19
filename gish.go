@@ -1,11 +1,15 @@
 package main
 
+// gish - recursively perform commands on a git-svn repo and its externals
+
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/url"
 	"os"
@@ -18,30 +22,28 @@ import (
 const (
 	defaultCheckoutArgs = "--no-minimize-url"
 
-	cacheRelPath = ".git/info/gish.conf"
-	oldCachePath = "git_svn_externals"
+	ignoreRelPath = ".git/info/exclude"
+	cacheRelPath  = ".git/info/gish.conf"
+	oldCachePath  = "git_svn_externals"
 )
 
 var (
-	altConfig = flag.String("c", "", "Path to config file to use if no other is found.")
-    // TODO: these options only mean anything to 'gish clean' it doesn't make sense that they must be
-    // provided prior to the 'clean' command. Use flag subsets to find flags following 'clean'
-    dryRun = flag.Bool("n", false, "If used with clean, list files that would be removed.")
-    force = flag.Bool("f", false, "If used with clean, enable removing files. Like git, -n or -f is required for clean.")
+	dryRun, force bool // cmdClean
 )
 
-func UsageExit(msg string) {
+func UsageExit(usage func(), msg string) {
 	fmt.Fprintln(os.Stderr, msg)
-	Usage()
+	usage()
 	os.Exit(1)
 }
 
 func Usage() {
-	fmt.Fprint(os.Stderr, "gish - recursively perform commands on a git-svn repo and its externals\n")
-	fmt.Fprint(os.Stderr, "Usage:\n\tgish [options] <command>\n")
+	fmt.Fprint(os.Stderr, "usage:\n\tgish <command> [options]\n")
 	fmt.Fprint(os.Stderr, "Commands:\n")
 	fmt.Fprint(os.Stderr, "\tclone: clone the repo's externals.\n")
 	fmt.Fprint(os.Stderr, "\tlist: print all the known git-svn repos in this directory\n")
+	fmt.Fprint(os.Stderr, "\tclean: perform git clean without removing externals\n")
+	fmt.Fprint(os.Stderr, "\tupdateignores: add externals to git ignore. Done automatically with clone.\n")
 	fmt.Fprint(os.Stderr, "\n\tOther commands are passed directly to git along with their arguments.\n")
 
 	fmt.Fprint(os.Stderr, "Options:\n")
@@ -75,8 +77,7 @@ func FindRootRepoPath() (string, error) {
 		os.Exit(1)
 	}
 
-	// XXX: non-portable
-	parts := strings.SplitAfter(pwd, "/")
+	parts := strings.SplitAfter(pwd, string(os.PathSeparator))
 	for i, _ := range parts {
 		testPath := path.Join(parts[:i+1]...)
 		if IsRepo(testPath) {
@@ -225,6 +226,130 @@ func (repo *Repo) Paths() []string {
 	return p
 }
 
+func contains(haystack [][]byte, needle []byte) bool {
+	for _, e := range haystack {
+		if bytes.Equal(e, needle) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (repo *Repo) ignoreExternalsAddMethod() {
+	// Convert externals to relative path bytes
+	externPaths := make([][]byte, 0, len(repo.Externals))
+	for _, ext := range repo.Externals {
+		relPath, err := filepath.Rel(repo.Path, ext.Path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error converting external path:", err)
+			continue
+		}
+
+		externPaths = append(externPaths, []byte(relPath))
+	}
+
+	var lines [][]byte
+	ignoreFilename := path.Join(repo.Path, ignoreRelPath)
+	b, err := ioutil.ReadFile(ignoreFilename)
+	if err != nil {
+		if os.IsNotExist(err) {
+		} else {
+			fmt.Fprintln(os.Stderr, "Read:", err)
+			return
+		}
+	} else {
+		lines = bytes.Split(b, []byte{'\n'})
+	}
+
+	addBuf := new(bytes.Buffer)
+
+	// The file is searched once for each externPath
+	for _, externPath := range externPaths {
+		if !contains(lines, externPath) {
+			fmt.Fprintln(addBuf, string(externPath))
+		}
+	}
+
+	if addBuf.Len() > 0 {
+		f, err := os.OpenFile(ignoreFilename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return
+		}
+		defer f.Close()
+
+		_, err = addBuf.WriteTo(f)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return
+		}
+	}
+}
+
+func (repo *Repo) ignoreExternalsSubtractMethod() {
+	externsToAdd := make(map[string]bool, len(repo.Externals))
+	for _, ext := range repo.Externals {
+		relPath, err := filepath.Rel(repo.Path, ext.Path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error converting external path:", err)
+			continue
+		}
+
+		externsToAdd[relPath] = true
+	}
+
+	f, err := os.OpenFile(path.Join(repo.Path, ignoreRelPath),
+		os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "IgnoreExternals:", err)
+		return
+	}
+	defer f.Close()
+
+	bufin := bufio.NewReader(f)
+	for {
+		ignore, err := bufin.ReadString('\n')
+		if err != nil {
+			if err != io.EOF {
+				fmt.Fprintln(os.Stderr, "IgnoreExternals:", err)
+			}
+			break
+		}
+
+		if externsToAdd[ignore] {
+			// The extern is already ignored. 
+			delete(externsToAdd, ignore)
+		}
+	}
+
+	for k := range externsToAdd {
+		fmt.Fprintln(f, k)
+	}
+}
+
+func (repo *Repo) IgnoreExternals() {
+	if len(repo.Externals) == 0 {
+		return // Nothing to do
+	}
+
+	// Add method: Is extern not in ignores? Add it!
+	// Subtract method: Is ignore an extern? Remove it from the add list.
+	const addMethod = false
+	if addMethod {
+		repo.ignoreExternalsAddMethod()
+	} else {
+		repo.ignoreExternalsSubtractMethod()
+	}
+}
+
+func (repo *Repo) IgnoreAllExternals() {
+	repo.IgnoreExternals()
+	for _, ext := range repo.Externals {
+		ext.IgnoreAllExternals()
+	}
+}
+
 // Link externals to a root repo
 func LinkTo(externs []Repo, root *Repo) {
 	for i := range externs {
@@ -238,10 +363,10 @@ func (repo *Repo) LinkRoot() {
 	LinkTo(repo.Externals, repo)
 }
 
-func RewritePaths(repo *Repo, a, b string) {
-	repo.Path = strings.Replace(repo.Path, a, b, 1)
+func RewritePaths(repo *Repo, from, to string) {
+	repo.Path = strings.Replace(repo.Path, from, to, 1)
 	for i := range repo.Externals {
-		RewritePaths(&repo.Externals[i], a, b)
+		RewritePaths(&repo.Externals[i], from, to)
 	}
 }
 
@@ -256,8 +381,12 @@ func (repo *Repo) Clone() error {
 			return err
 		}
 	} else {
-		fmt.Printf("Cloning %q from svn url %q\n", repo.Path, repo.Url)
+		if IsDir(repo.Path) {
+			fmt.Fprintf(os.Stderr, "Path %s exists but is not a repo.\n", repo.Path)
+			os.Exit(1)
+		}
 
+		fmt.Printf("Cloning %q from svn url %q\n", repo.Path, repo.Url)
 		err := os.MkdirAll(repo.Path, 0770)
 		if err != nil {
 			return err
@@ -281,6 +410,8 @@ func (repo *Repo) Clone() error {
 		err := repo.LoadExternals()
 		if err != nil {
 			return err
+		} else {
+			repo.IgnoreExternals()
 		}
 	}
 
@@ -299,10 +430,6 @@ func (repo *Repo) Clone() error {
 
 // Do a 'git clean' on each repo, removing the externals from the list.
 func (repo *Repo) Clean() error {
-    if !*force && !*dryRun {
-        UsageExit("-n or -f required for clean.")
-    }
-
 	toRmStr, err := shellCmd(repo.Path, "git", "clean", "-ndx")
 	if err != nil {
 		return err
@@ -327,7 +454,7 @@ func (repo *Repo) Clean() error {
 		qualifiedR := path.Join(repo.Path, r)
 
 		if !extMap[r] {
-			if !*dryRun {
+			if !dryRun {
 				err = os.RemoveAll(qualifiedR)
 				if err != nil {
 					fmt.Fprintln(os.Stdout, err)
@@ -391,24 +518,23 @@ func (repo *Repo) ConvertExternCache() error {
 func (repo *Repo) WriteConfig() error {
 	if repo.Root != nil {
 		return repo.Root.WriteConfig()
-	} else {
-		b, err := json.MarshalIndent(repo, "", "  ")
-		if err != nil {
-			return err
-		}
-
-		return ioutil.WriteFile(path.Join(repo.Path, cacheRelPath), b, 0660)
 	}
-	panic("Unreachable")
+
+	b, err := json.MarshalIndent(repo, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return ioutil.WriteFile(path.Join(repo.Path, cacheRelPath), b, 0660)
 }
 
 // Create a Repo from a config file at the given location.
 // Location can be a path to a git repo or to a config file.
-func LoadConfig(repoPath string) (repo *Repo, err error) {
-	isDir := IsDir(repoPath)
-	cachePath := repoPath
+func LoadConfig(configPath string) (repo *Repo, err error) {
+	isDir := IsDir(configPath)
+	cachePath := configPath
 	if isDir {
-		cachePath = path.Join(repoPath, cacheRelPath)
+		cachePath = path.Join(configPath, cacheRelPath)
 	}
 
 	// Look for new config
@@ -419,14 +545,14 @@ func LoadConfig(repoPath string) (repo *Repo, err error) {
 	} else {
 		// Look for old externals cache
 		if isDir {
-			cachePath = path.Join(repoPath, oldCachePath)
+			cachePath = path.Join(configPath, oldCachePath)
 		}
 		_, err = os.Stat(cachePath)
 		if err == nil {
-			repo := &Repo{Path: repoPath}
+			repo := &Repo{Path: configPath}
 			err = repo.ConvertExternCache()
 		} else {
-			err = fmt.Errorf("No config found in %s", repoPath)
+			err = fmt.Errorf("No config found in %s", configPath)
 		}
 	}
 
@@ -437,82 +563,99 @@ func LoadConfig(repoPath string) (repo *Repo, err error) {
 	return repo, err
 }
 
-// TODO: use cases handled?
-// gish use cases:
-// * completely new, no config
-//       gish clone svn://svnserver/repo [destdir]
-// * alt config
-//    1) Completely new
-//       gish clone --config=alt [destdir]
-//    2) Existing repo (any command).
-//       gish --config=alt [command]
-//       -- Check urls against repo
-//       -- Assume externs are right??
-// * Clone of root, no config
-// TODO: Clone of existing git-svn repo?
+func NewRepoClone(cmdLineArgs []string) (repo *Repo) {
+	// args are "clone", 
+	flags := flag.NewFlagSet("clone", flag.ExitOnError)
+	altConfig := flags.String("c", "", "Path to config file to use if no other is found.")
+	flags.Usage = func() {
+		fmt.Fprint(os.Stderr, "usage:\n\tgish clone [-c=<cfgpath> | svnUrl] [destDir]\n")
+		fmt.Fprint(os.Stderr, "\tStandard usage is 'gish clone <svnUrl> [destDir]'\n")
+		fmt.Fprint(os.Stderr, "\tIf a path to a gish config file (or repo containing one) is provided,\n")
+		fmt.Fprint(os.Stderr, "\tGish will use the url, externals, etc from that config.\n")
+
+		fmt.Fprint(os.Stderr, "Options:\n")
+		flags.PrintDefaults()
+	}
+
+	if len(cmdLineArgs) < 2 {
+		UsageExit(flags.Usage, "Not enough arguments to 'gish clone'.")
+	}
+
+	flags.Parse(cmdLineArgs[1:])
+
+	// Clone can be used three ways, two are handled here
+	if *altConfig == "" {
+		// SVN URL required
+		if len(cmdLineArgs) < 2 {
+			UsageExit(flags.Usage, "Not enough arguments to 'gish clone'. SVN URL required")
+		}
+
+		// Fill in the url provided, clone will fill the rest
+		svnUrl, err := url.Parse(strings.TrimSpace(cmdLineArgs[1]))
+		if err != nil {
+			UsageExit(flags.Usage, fmt.Sprint("Error parsing svn Url: %q", err.Error()))
+		}
+
+		var destDir string
+		if len(cmdLineArgs) == 3 {
+			destDir = cmdLineArgs[2]
+		} else {
+			pathParts := strings.Split(svnUrl.Path, "/")
+			destDir = pathParts[len(pathParts)-1]
+		}
+
+		absDestDir, err := filepath.Abs(destDir)
+		if err != nil {
+			UsageExit(flags.Usage, fmt.Sprintf("invalid destdir %s: %v", destDir, err))
+		}
+
+		repo = &Repo{Path: absDestDir, Url: svnUrl.String()}
+	} else {
+		/* TODO: If the alt-config was a path to an existing git-svn repo, we could
+		   clone it rather than going to the server. 
+		*/
+
+		// DestDir required
+		if len(cmdLineArgs) < 2 {
+			UsageExit(flags.Usage, "Not enough arguments to 'gish clone'. Destination dir required")
+		}
+
+		destDir, err := filepath.Abs(cmdLineArgs[1])
+		if err != nil {
+			UsageExit(flags.Usage, fmt.Sprintf("invalid destdir %s: %v", cmdLineArgs[1], err))
+		}
+
+		repo, err = LoadConfig(*altConfig)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Provided alternate config is invalid: ", err.Error())
+			os.Exit(1)
+		}
+
+		RewritePaths(repo, repo.Path, destDir)
+	}
+
+	return repo
+}
+
 func NewRepo(cmdLineArgs []string) (*Repo, error) {
+	if cmdLineArgs[0] == "clone" {
+		repo := NewRepoClone(cmdLineArgs)
+		return repo, nil
+	}
+
 	rootPath, err := FindRootRepoPath()
 	if err != nil {
-		if cmdLineArgs[0] == "clone" {
-			// Clone can be used three ways, two are handled here
-			if *altConfig != "" {
-				// Usage is:  gish clone --config=alt destdir
-				if len(cmdLineArgs) != 2 {
-					UsageExit("Invalid args to 'gish clone'.")
-				}
-
-				destDir, err := filepath.Abs(cmdLineArgs[1])
-				if err != nil {
-					UsageExit(fmt.Sprintf("invalid destdir %s: %v", cmdLineArgs[1], err))
-				}
-
-				repo, err := LoadConfig(*altConfig)
-				if err != nil {
-					fmt.Fprintln(os.Stderr,
-						"Provided alternate config is invalid: ", err.Error())
-					os.Exit(1)
-				}
-
-				RewritePaths(repo, repo.Path, destDir)
-				return repo, nil
-			} else {
-				// TODO: is this usage documented?
-				// TODO: do both w/ and w/o destdir work?
-				// Usage is:  gish clone svn://svnserver/repo [destdir]
-
-				if len(cmdLineArgs) < 2 {
-					UsageExit("Not enough arguments to 'gish clone'.")
-				}
-
-				// Fill in the url provided, clone will fill the rest
-				svnUrl, err := url.Parse(strings.TrimSpace(cmdLineArgs[1]))
-				if err != nil {
-					UsageExit(fmt.Sprint("Error parsing svn Url: %q", err.Error()))
-				}
-
-				var destDir string
-				if len(cmdLineArgs) == 3 {
-					destDir = cmdLineArgs[2]
-				} else {
-					pathParts := strings.Split(svnUrl.Path, "/")
-					destDir = pathParts[len(pathParts)-1]
-				}
-
-				absDestDir, err := filepath.Abs(destDir)
-				if err != nil {
-					UsageExit(fmt.Sprintf("invalid destdir %s: %v", destDir, err))
-				}
-
-				return &Repo{Path: absDestDir, Url: svnUrl.String()}, nil
-			}
-		} else {
-			return nil, err
-		}
+		return nil, err
 	}
 
 	repo, err := LoadConfig(rootPath)
 	if err == nil {
 		return repo, nil
+	}
+
+	// Ensure the Repo path points to the directory containing the git-svn repo
+	if repo.Path != rootPath {
+		RewritePaths(repo, repo.Path, rootPath)
 	}
 
 	// LoadConfig failed, create a repo from git
@@ -530,16 +673,51 @@ func NewRepo(cmdLineArgs []string) (*Repo, error) {
 		return nil, err
 	}
 
-    return repo, nil
+	return repo, nil
+}
+
+func cmdClean(args []string, repo *Repo) {
+	flags := flag.NewFlagSet("clean", flag.ExitOnError)
+	flags.BoolVar(&dryRun, "n", false, "List the files that would be removed.")
+	flags.BoolVar(&force, "f", false, "Enable file removal. Like git, -n or -f is required for clean.")
+	flags.Usage = func() {
+		fmt.Fprint(os.Stderr, "usage:\n\tgish clean [options]\n")
+		fmt.Fprint(os.Stderr, "Options:\n")
+		flags.PrintDefaults()
+	}
+
+	if len(args) < 2 {
+		UsageExit(flags.Usage, "Not enough arguments to 'gish clean'.")
+	}
+
+	flags.Parse(args[1:])
+
+	if !force && !dryRun {
+		UsageExit(flags.Usage, "-n or -f required for clean.")
+	}
+
+	repo.Clean()
 }
 
 func main() {
+	flag.Usage = Usage
 	flag.Parse()
 
 	cmdLineArgs := flag.Args()
 	if len(cmdLineArgs) == 0 {
-		UsageExit("No command provided.")
+		UsageExit(Usage, "No command provided.")
 	}
+
+	/* TODO: NewRepo should be integrated into a Command interface then there
+	   is ONE test for the args, then everything else below that that is Command code
+	   has Command context, and any Command context that affects Repo becomes a parameter
+
+	   A command has Flags, minArgs, and an action. 
+	   type Command interface {
+	       Match(args []string) true
+
+	   }
+	*/
 
 	repo, err := NewRepo(cmdLineArgs)
 	if err != nil {
@@ -547,19 +725,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	// TODO: add externs to .git/info/exclude
-
 	switch cmdLineArgs[0] {
 	case "clone":
 		err = repo.Clone()
 		if err != nil { // Skip the config write. Clone() writes config for each successful clone.
-			fmt.Println(err)
+			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 	case "list":
 		repo.List()
 	case "clean":
-		repo.Clean()
+		cmdClean(cmdLineArgs, repo)
+	case "updateignores":
+		repo.IgnoreAllExternals()
 	default:
 		paths := repo.Paths()
 		for _, path := range paths {
