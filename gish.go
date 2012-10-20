@@ -701,6 +701,28 @@ func cmdClean(args []string, repo *Repo) {
 	repo.Clean()
 }
 
+type actionFunc func(cmdLineArgs []string) (error)
+type commandAction interface {
+    Action(cmdLineArgs []string) (error)
+    Usage()
+}
+
+
+type command struct {
+    Label string
+    Action commandAction
+}
+
+func NewActionThatExpectsRepo(cmdAction actionFunc) (actionFunc) {
+    return cmdAction
+}
+
+var gishCommands = []command{
+    {"clone", cmdClone},
+    {"clean", cmdList},
+}
+
+
 func main() {
 	flag.Usage = Usage
 	flag.Parse()
