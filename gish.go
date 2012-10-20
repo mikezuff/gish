@@ -46,8 +46,10 @@ func Usage() {
 	fmt.Fprint(os.Stderr, "\tupdateignores: add externals to git ignore. Done automatically with clone.\n")
 	fmt.Fprint(os.Stderr, "\n\tOther commands are passed directly to git along with their arguments.\n")
 
+    /*
 	fmt.Fprint(os.Stderr, "Options:\n")
 	flag.PrintDefaults()
+    */
 }
 
 // Returns true if the given directory is a git repository. (Contains a .git subdir)
