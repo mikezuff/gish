@@ -31,6 +31,10 @@ Gish is written in go. The Go compiler is [simple to install](http://golang.org/
 
 If you have problems with these commands, ensure that $GOPATH and $GOROOT are set properly and that $GOPATH/bin and $GOROOT/bin are in your $PATH. See the [Go installation instructions](http://golang.org/doc/install) for more info.
 
+Known Issues
+------------
+Only the "^" svn relative external format is supported.
+
 Thanks
 ------
 Credit is due to the authors of these other tools for inspiring a Go implementation.

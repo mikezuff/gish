@@ -29,6 +29,7 @@ const (
 
 var (
 	dryRun, force bool // cmdClean
+	askForArgs    bool // clone
 )
 
 func UsageExit(usage func(), msg string) {
@@ -46,10 +47,10 @@ func Usage() {
 	fmt.Fprint(os.Stderr, "\tupdateignores: add externals to git ignore. Done automatically with clone.\n")
 	fmt.Fprint(os.Stderr, "\n\tOther commands are passed directly to git along with their arguments.\n")
 
-    /*
-	fmt.Fprint(os.Stderr, "Options:\n")
-	flag.PrintDefaults()
-    */
+	/*
+		fmt.Fprint(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+	*/
 }
 
 // Returns true if the given directory is a git repository. (Contains a .git subdir)
@@ -360,8 +361,9 @@ func LinkTo(externs []Repo, root *Repo) {
 	}
 }
 
-// Link Root of all child repos to this repo
+// Link Root of all repos in the tree to the root repo.
 func (repo *Repo) LinkRoot() {
+	repo.Root = repo
 	LinkTo(repo.Externals, repo)
 }
 
@@ -370,6 +372,29 @@ func RewritePaths(repo *Repo, from, to string) {
 	for i := range repo.Externals {
 		RewritePaths(&repo.Externals[i], from, to)
 	}
+}
+
+func (repo *Repo) getCheckoutArgs() []string {
+	if askForArgs {
+		fmt.Printf("Provide checkout args for %s.\n", repo.Url)
+
+		buf := bufio.NewReader(os.Stdin)
+		in, err := buf.ReadString('\n')     // TODO: why does this need two newlines?
+		fmt.Printf("Read %v %q\n", err, in) // TODO: DELME
+		in = strings.TrimSpace(in)
+		if err == nil {
+			if in != "" {
+				repo.CheckoutArgs = in
+				return strings.Split(repo.CheckoutArgs, " ")
+			}
+		}
+	}
+
+	if repo.CheckoutArgs != "" {
+		return strings.Split(repo.CheckoutArgs, " ")
+	}
+
+	return []string{defaultCheckoutArgs}
 }
 
 // Check that the repo and its externals are cloned.
@@ -395,11 +420,7 @@ func (repo *Repo) Clone() error {
 		}
 
 		args := []string{"svn", "clone"}
-		if repo.CheckoutArgs != "" {
-			args = append(args, strings.Split(repo.CheckoutArgs, " ")...)
-		} else {
-			args = append(args, defaultCheckoutArgs)
-		}
+		args = append(args, repo.getCheckoutArgs()...)
 		args = append(args, repo.Url, repoDir)
 		fmt.Printf("> git %v\n", args)
 		err = interactiveShellCmd(repoPath, "git", args...)
@@ -518,7 +539,7 @@ func (repo *Repo) ConvertExternCache() error {
 
 // If necessary, write the repo configuration to file.
 func (repo *Repo) WriteConfig() error {
-	if repo.Root != nil {
+	if repo.Root != repo {
 		return repo.Root.WriteConfig()
 	}
 
@@ -569,15 +590,29 @@ func NewRepoClone(cmdLineArgs []string) (repo *Repo) {
 	// args are "clone", 
 	flags := flag.NewFlagSet("clone", flag.ExitOnError)
 	altConfig := flags.String("c", "", "Path to config file to use if no other is found.")
+	flags.BoolVar(&askForArgs, "i", false, "Interactively prompt for clone arguments.")
 	flags.Usage = func() {
 		fmt.Fprint(os.Stderr, "usage:\n\tgish clone [-c=<cfgpath> | svnUrl] [destDir]\n")
 		fmt.Fprint(os.Stderr, "\tStandard usage is 'gish clone <svnUrl> [destDir]'\n")
 		fmt.Fprint(os.Stderr, "\tIf a path to a gish config file (or repo containing one) is provided,\n")
 		fmt.Fprint(os.Stderr, "\tGish will use the url, externals, etc from that config.\n")
+		fmt.Fprintf(os.Stderr, "\tThe default clone arguments are '%s'\n", defaultCheckoutArgs)
 
 		fmt.Fprint(os.Stderr, "Options:\n")
 		flags.PrintDefaults()
 	}
+
+	// Clone:
+	// 'gish clone -i https://svn.houston.hp.com/rg0103/tpt-6wind/6WINDGate/trunk'
+	// 'gish clone -c=altpath trunk
+
+	// Update/subclone:
+	// 'gish clone' in a repo
+	// 'gish clone trunk' where trunk is repo
+	// If no args and pwd IsRepo or no URL and destDir IsRepo, update it
+
+	// Clone git-svn repo
+	// 'gish clone trunk cloneOfTrunk'
 
 	if len(cmdLineArgs) < 2 {
 		UsageExit(flags.Usage, "Not enough arguments to 'gish clone'.")
@@ -585,22 +620,26 @@ func NewRepoClone(cmdLineArgs []string) (repo *Repo) {
 
 	flags.Parse(cmdLineArgs[1:])
 
+	nonFlagArgs := flags.Args()
 	// Clone can be used three ways, two are handled here
 	if *altConfig == "" {
 		// SVN URL required
-		if len(cmdLineArgs) < 2 {
+		if len(nonFlagArgs) < 1 {
 			UsageExit(flags.Usage, "Not enough arguments to 'gish clone'. SVN URL required")
+		} else if len(nonFlagArgs) > 2 {
+			UsageExit(flags.Usage, "Too many arguments.")
 		}
 
 		// Fill in the url provided, clone will fill the rest
-		svnUrl, err := url.Parse(strings.TrimSpace(cmdLineArgs[1]))
+		// This check may not be worth much. Apparently "-i=false" is a valid url.
+		svnUrl, err := url.Parse(strings.TrimSpace(nonFlagArgs[0]))
 		if err != nil {
 			UsageExit(flags.Usage, fmt.Sprint("Error parsing svn Url: %q", err.Error()))
 		}
 
 		var destDir string
-		if len(cmdLineArgs) == 3 {
-			destDir = cmdLineArgs[2]
+		if len(nonFlagArgs) == 2 {
+			destDir = nonFlagArgs[1]
 		} else {
 			pathParts := strings.Split(svnUrl.Path, "/")
 			destDir = pathParts[len(pathParts)-1]
@@ -614,17 +653,20 @@ func NewRepoClone(cmdLineArgs []string) (repo *Repo) {
 		repo = &Repo{Path: absDestDir, Url: svnUrl.String()}
 	} else {
 		/* TODO: If the alt-config was a path to an existing git-svn repo, we could
-		   clone it rather than going to the server. 
+				   clone it rather than going to the server.
+		           Same action if nonFlagArgs[0] is a local path... unless svn repos can be accessed locally.
 		*/
 
 		// DestDir required
-		if len(cmdLineArgs) < 2 {
+		if len(nonFlagArgs) < 1 {
 			UsageExit(flags.Usage, "Not enough arguments to 'gish clone'. Destination dir required")
+		} else if len(nonFlagArgs) > 1 {
+			UsageExit(flags.Usage, "Too many arguments.")
 		}
 
-		destDir, err := filepath.Abs(cmdLineArgs[1])
+		destDir, err := filepath.Abs(nonFlagArgs[0])
 		if err != nil {
-			UsageExit(flags.Usage, fmt.Sprintf("invalid destdir %s: %v", cmdLineArgs[1], err))
+			UsageExit(flags.Usage, fmt.Sprintf("invalid destdir %s: %v", nonFlagArgs[0], err))
 		}
 
 		repo, err = LoadConfig(*altConfig)
@@ -642,6 +684,11 @@ func NewRepoClone(cmdLineArgs []string) (repo *Repo) {
 func NewRepo(cmdLineArgs []string) (*Repo, error) {
 	if cmdLineArgs[0] == "clone" {
 		repo := NewRepoClone(cmdLineArgs)
+		// The root member of the root repo points to itself.
+		// Code can always jump through the root pointer to get to the root.
+		// Recursive code will have to test or have separate initial/root functions.
+		repo.Root = repo
+
 		return repo, nil
 	}
 
@@ -652,6 +699,7 @@ func NewRepo(cmdLineArgs []string) (*Repo, error) {
 
 	repo, err := LoadConfig(rootPath)
 	if err == nil {
+		repo.Root = repo
 		return repo, nil
 	}
 
@@ -669,6 +717,7 @@ func NewRepo(cmdLineArgs []string) (*Repo, error) {
 	}
 
 	repo = &Repo{Path: rootPath, Url: url}
+	repo.Root = repo
 
 	err = repo.LoadExternals()
 	if err != nil {
@@ -701,7 +750,22 @@ func cmdClean(args []string, repo *Repo) {
 	repo.Clean()
 }
 
+// TODO: DELME
+func bufReadLine() {
+	fmt.Printf("Give a string\n")
+	buf := bufio.NewReader(os.Stdin)
+	in, err := buf.ReadString('\n')
+	fmt.Printf("%v %q\n", err, in)
+}
+
 func main() {
+
+    /* TODO: DELME
+	interactiveShellCmd("/home/mzuffoletti/w/b/golib/src/gish", "/bin/ls")
+	bufReadLine()
+	os.Exit(1)
+    */
+
 	flag.Usage = Usage
 	flag.Parse()
 
