@@ -697,15 +697,12 @@ func NewRepo(cmdLineArgs []string) (*Repo, error) {
 		return nil, err
 	}
 
-	repo, err := LoadConfig(rootPath)
-	if err == nil {
+	if repo, err := LoadConfig(rootPath); err == nil {
 		repo.Root = repo
-		return repo, nil
-	}
-
-	// Ensure the Repo path points to the directory containing the git-svn repo
-	if repo.Path != rootPath {
+		// Ensure the Repo path points to the directory containing the git-svn repo
 		RewritePaths(repo, repo.Path, rootPath)
+
+		return repo, nil
 	}
 
 	// LoadConfig failed, create a repo from git
@@ -716,7 +713,7 @@ func NewRepo(cmdLineArgs []string) (*Repo, error) {
 		return nil, err
 	}
 
-	repo = &Repo{Path: rootPath, Url: url}
+	repo := &Repo{Path: rootPath, Url: url}
 	repo.Root = repo
 
 	err = repo.LoadExternals()
