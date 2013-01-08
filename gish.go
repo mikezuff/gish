@@ -13,6 +13,7 @@ import (
 	"io/ioutil"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -51,6 +52,26 @@ func Usage() {
 		fmt.Fprint(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 	*/
+}
+
+// Execute the given command with its input connected to stdin.
+func execCmd(dir, arg0 string, args ...string) error {
+	cmd := exec.Command(arg0, args...)
+	cmd.Env = os.Environ()
+	cmd.Dir = dir
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// Execute the given command connecting its input to stdin, return its output as a byte slice.
+func execCmdCombinedOutput(dir, arg0 string, args ...string) ([]byte, error) {
+	cmd := exec.Command(arg0, args...)
+	cmd.Env = os.Environ()
+	cmd.Dir = dir
+	cmd.Stdin = os.Stdin
+	return cmd.CombinedOutput()
 }
 
 // Returns true if the given directory is a git repository. (Contains a .git subdir)
@@ -95,12 +116,12 @@ func FindRootRepoPath() (string, error) {
 // Get svn info for the repo. Label is the string to the left of the colon in the 
 // standard svn info format. RepoPath must be a git-svn repo.
 func GitSvnInfo(repoPath, label string) (string, error) {
-	out, err := shellCmd(repoPath, "git", "svn", "info")
+	out, err := execCmdCombinedOutput(repoPath, "git", "svn", "info")
 	if err != nil {
 		return "", fmt.Errorf("git svn info failed (%s), not a git repo??\n", err)
 	}
 
-	lines := strings.SplitAfter(out, "\n")
+	lines := strings.SplitAfter(string(out), "\n")
 	for _, line := range lines {
 		w := strings.SplitN(line, ":", 2)
 		if w[0] == label {
@@ -134,12 +155,12 @@ func ReplaceRelative(repoRootUrl, externalRef string) (string, error) {
 }
 
 func GitSvnUrl(repoPath string) (url string, err error) {
-	out, err := shellCmd(repoPath, "git", "svn", "info")
+	out, err := execCmdCombinedOutput(repoPath, "git", "svn", "info")
 	if err != nil {
 		return "", err
 	}
 
-	lines := strings.SplitAfter(out, "\n")
+	lines := strings.SplitAfter(string(out), "\n")
 	for _, line := range lines {
 		w := strings.SplitN(line, ":", 2)
 		if w[0] == "URL" {
@@ -159,12 +180,12 @@ type Repo struct {
 }
 
 func (repo *Repo) LoadExternals() error {
-	rawExternals, err := interactiveShellCmdToString(repo.Path, "git", "svn", "show-externals")
+	rawExternals, err := execCmdCombinedOutput(repo.Path, "git", "svn", "show-externals")
 	if err != nil {
 		return err
 	}
 
-	return repo.CookExternals(rawExternals)
+	return repo.CookExternals(string(rawExternals))
 }
 
 func (repo *Repo) CookExternals(rawExternals string) error {
@@ -379,8 +400,7 @@ func (repo *Repo) getCheckoutArgs() []string {
 		fmt.Printf("Provide checkout args for %s.\n", repo.Url)
 
 		buf := bufio.NewReader(os.Stdin)
-		in, err := buf.ReadString('\n')     // TODO: why does this need two newlines?
-		fmt.Printf("Read %v %q\n", err, in) // TODO: DELME
+		in, err := buf.ReadString('\n')
 		in = strings.TrimSpace(in)
 		if err == nil {
 			if in != "" {
@@ -403,7 +423,7 @@ func (repo *Repo) Clone() error {
 
 	if IsRepo(repo.Path) {
 		fmt.Printf("Path %s is a repo, updating from svn.\n", repo.Path)
-		err := interactiveShellCmd(repo.Path, "git", "svn", "rebase")
+		err := execCmd(repo.Path, "git", "svn", "rebase")
 		if err != nil {
 			return err
 		}
@@ -422,8 +442,7 @@ func (repo *Repo) Clone() error {
 		args := []string{"svn", "clone"}
 		args = append(args, repo.getCheckoutArgs()...)
 		args = append(args, repo.Url, repoDir)
-		fmt.Printf("> git %v\n", args)
-		err = interactiveShellCmd(repoPath, "git", args...)
+		err = execCmd(repoPath, "git", args...)
 		if err != nil {
 			return err
 		}
@@ -453,7 +472,7 @@ func (repo *Repo) Clone() error {
 
 // Do a 'git clean' on each repo, removing the externals from the list.
 func (repo *Repo) Clean() error {
-	toRmStr, err := shellCmd(repo.Path, "git", "clean", "-ndx")
+	toRmStr, err := execCmdCombinedOutput(repo.Path, "git", "clean", "-ndx")
 	if err != nil {
 		return err
 	}
@@ -465,7 +484,7 @@ func (repo *Repo) Clean() error {
 		extMap[extRelPath] = true
 	}
 
-	toRm := strings.Split(toRmStr, "\n")
+	toRm := strings.Split(string(toRmStr), "\n")
 	for i := range toRm {
 		r := strings.Replace(toRm[i], "Would remove ", "", 1)
 		r = strings.Trim(r, "/")
@@ -606,6 +625,7 @@ func NewRepoClone(cmdLineArgs []string) (repo *Repo) {
 	// 'gish clone -i https://svn.houston.hp.com/rg0103/tpt-6wind/6WINDGate/trunk'
 	// 'gish clone -c=altpath trunk
 
+	// TODO: these aren't supported yet
 	// Update/subclone:
 	// 'gish clone' in a repo
 	// 'gish clone trunk' where trunk is repo
@@ -747,22 +767,7 @@ func cmdClean(args []string, repo *Repo) {
 	repo.Clean()
 }
 
-// TODO: DELME
-func bufReadLine() {
-	fmt.Printf("Give a string\n")
-	buf := bufio.NewReader(os.Stdin)
-	in, err := buf.ReadString('\n')
-	fmt.Printf("%v %q\n", err, in)
-}
-
 func main() {
-
-    /* TODO: DELME
-	interactiveShellCmd("/home/mzuffoletti/w/b/golib/src/gish", "/bin/ls")
-	bufReadLine()
-	os.Exit(1)
-    */
-
 	flag.Usage = Usage
 	flag.Parse()
 
@@ -805,7 +810,7 @@ func main() {
 		paths := repo.Paths()
 		for _, path := range paths {
 			fmt.Printf("Repo %s:\n", path)
-			err = interactiveShellCmd(path, "git", cmdLineArgs...)
+			err = execCmd(path, "git", cmdLineArgs...)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "Git returned error:", err)
 				// Don't quit, commands that get paged will return error.
