@@ -2,8 +2,9 @@ gish - git-svn helper
 =====================
 Utility for management of git-svn repositories that contain externals.
 
-* Clone: recursive clone of externals into an existing git-svn repository
-* Clean: recursive git clean, doesn't remove external repo
+* clone: recursive clone of externals into an existing git-svn repository
+* list: list the root path of the current git repo and the paths to its externals
+* clean: recursive git clean, won't remove external repos
 * Execute git with command arguments within repo and its externals.
 
 Usage
@@ -20,7 +21,8 @@ Use a preexisting config file to create a new repo. This avoids fetching the ext
 ### Clean
 Remove all untracked files. `-n` lists files that would be removed, `-f` enables removal. One flag must be provided.
 
-Clone the root repo manually. Within that repo, `gish update` will recursively clone the externals. Normal git commands are performed on the root repo and all externals, recursively. For example, `gish status -uno` will show the status for all the repos, hiding the untracked files.
+### Recursive git
+Normal git commands are performed on the root repo and all externals, recursively. For example, `gish status -uno` will show the status for all the repos, hiding the untracked files.
 
 Installation
 ------------

@@ -43,10 +43,11 @@ func Usage() {
 	fmt.Fprint(os.Stderr, "usage:\n\tgish <command> [options]\n")
 	fmt.Fprint(os.Stderr, "Commands:\n")
 	fmt.Fprint(os.Stderr, "\tclone: clone the repo's externals.\n")
-	fmt.Fprint(os.Stderr, "\tlist: print all the known git-svn repos in this directory\n")
+	fmt.Fprint(os.Stderr, "\tlist: list the root path of the current git repo and the paths to its externals.\n")
 	fmt.Fprint(os.Stderr, "\tclean: perform git clean without removing externals\n")
 	fmt.Fprint(os.Stderr, "\tupdateignores: add externals to git ignore. Done automatically with clone.\n")
 	fmt.Fprint(os.Stderr, "\n\tOther commands are passed directly to git along with their arguments.\n")
+	fmt.Fprint(os.Stderr, "\n\tUse 'gish <command> -h' for command-specific help.\n")
 
 	/*
 		fmt.Fprint(os.Stderr, "Options:\n")
@@ -397,7 +398,7 @@ func RewritePaths(repo *Repo, from, to string) {
 
 func (repo *Repo) getCheckoutArgs() []string {
 	if askForArgs {
-		fmt.Printf("Provide checkout args for %s.\n", repo.Url)
+		fmt.Printf("Provide checkout args for %s:\n> ", repo.Url)
 
 		buf := bufio.NewReader(os.Stdin)
 		in, err := buf.ReadString('\n')
