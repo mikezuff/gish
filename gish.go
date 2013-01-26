@@ -724,10 +724,11 @@ func NewRepo(cmdLineArgs []string) (*Repo, error) {
 		RewritePaths(repo, repo.Path, rootPath)
 
 		return repo, nil
+	} else {
+		fmt.Println(err)
 	}
 
 	// LoadConfig failed, create a repo from git
-	fmt.Println(err)
 	fmt.Printf("Loading info from git. This may take a while.\n")
 	url, err := GitSvnInfo(rootPath, "URL")
 	if err != nil {
