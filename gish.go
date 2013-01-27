@@ -473,6 +473,8 @@ func (repo *Repo) Clone() error {
 
 // Do a 'git clean' on each repo, removing the externals from the list.
 func (repo *Repo) Clean() error {
+	fmt.Fprintln(os.Stderr, "Cleaning repo ", repo.Path)
+
 	toRmStr, err := execCmdCombinedOutput(repo.Path, "git", "clean", "-ndx")
 	if err != nil {
 		return err
@@ -505,8 +507,6 @@ func (repo *Repo) Clean() error {
 			} else {
 				fmt.Printf("Would remove %q\n", qualifiedR)
 			}
-		} else {
-			fmt.Printf("Ignoring external at %q\n", qualifiedR)
 		}
 	}
 
