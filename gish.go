@@ -14,7 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path"
+	pathLib "path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -23,9 +23,11 @@ import (
 const (
 	defaultCheckoutArgs = "--no-minimize-url"
 
-	ignoreRelPath = ".git/info/exclude"
-	cacheRelPath  = ".git/info/gish.conf"
-	oldCachePath  = "git_svn_externals"
+	ignoreRelPath       = ".git/info/exclude"
+	gishCachePathV2     = ".git/info/gish.conf"
+	gishCachePathV1     = "git_svn_externals"
+	gishNotesRef        = "GIT_NOTES_REF=refs/notes/gish"
+	persistWithGitNotes = true
 )
 
 var (
@@ -56,7 +58,7 @@ func Usage() {
 }
 
 // Execute the given command with its input connected to stdin.
-func execCmd(dir, arg0 string, args ...string) error {
+func execCmdAttached(dir, arg0 string, args ...string) error {
 	cmd := exec.Command(arg0, args...)
 	cmd.Env = os.Environ()
 	cmd.Dir = dir
@@ -67,7 +69,7 @@ func execCmd(dir, arg0 string, args ...string) error {
 }
 
 // Execute the given command connecting its input to stdin, return its output as a byte slice.
-func execCmdCombinedOutput(dir, arg0 string, args ...string) ([]byte, error) {
+func execCmd(dir, arg0 string, args ...string) ([]byte, error) {
 	cmd := exec.Command(arg0, args...)
 	cmd.Env = os.Environ()
 	cmd.Dir = dir
@@ -75,9 +77,70 @@ func execCmdCombinedOutput(dir, arg0 string, args ...string) ([]byte, error) {
 	return cmd.CombinedOutput()
 }
 
+func execCmdEnv(dir string, env []string, arg0 string, args ...string) ([]byte, error) {
+	cmd := exec.Command(arg0, args...)
+	if env == nil {
+		cmd.Env = os.Environ()
+	} else {
+		cmd.Env = append(os.Environ(), env...)
+	}
+	cmd.Dir = dir
+	cmd.Stdin = os.Stdin
+	return cmd.CombinedOutput()
+}
+
+func execGishNotes(path string, args ...string) ([]byte, error) {
+	return execCmdEnv(path, []string{gishNotesRef}, "git", append([]string{"notes"}, args...)...)
+}
+
+// GitCreateObject creates a hashed object containing the given blob.
+// Returns a string containing the object hash or git error message if error != nil.
+func GitCreateObject(path string, blob []byte) (string, error) {
+	cmd := exec.Command("git", "hash-object", "-w", "--stdin")
+	cmd.Env = os.Environ()
+	cmd.Dir = path
+	cmd.Stdin = bytes.NewBuffer(blob)
+	out, err := cmd.CombinedOutput()
+	outStr := string(bytes.TrimSpace(out))
+	fmt.Println("hash-object OUT:", outStr)
+	return outStr, err
+}
+
+func GitNoteAdd(path string, note []byte) error {
+	hash, err := GitCreateObject(path, note)
+	if err != nil {
+		return err
+	}
+
+	out, err := execGishNotes(path, "add", "-f", "-C", hash)
+	fmt.Println("notesadd OUT:", out)
+	return err
+}
+
+func GitLookupLatestGishNote(path string) (string, error) {
+	out, err := execGishNotes(path, "list")
+	if err != nil {
+		return "", err
+	}
+
+	// Get the hash of the object that the note references.
+	b := bytes.NewBuffer(out)
+	_, err = b.ReadBytes(' ') // Ignore note hash
+	if err != nil {
+		return "", err
+	}
+
+	notedObjHash, err := b.ReadBytes('\n')
+	if err != nil {
+		return "", err
+	}
+
+	return string(bytes.TrimSpace(notedObjHash)), nil
+}
+
 // Returns true if the given directory is a git repository. (Contains a .git subdir)
 func IsRepo(repoPath string) bool {
-	rp := path.Join(repoPath, ".git")
+	rp := pathLib.Join(repoPath, ".git")
 	info, err := os.Stat(rp)
 	if err != nil {
 		return false
@@ -104,7 +167,7 @@ func FindRootRepoPath() (string, error) {
 
 	parts := strings.SplitAfter(pwd, string(os.PathSeparator))
 	for i, _ := range parts {
-		testPath := path.Join(parts[:i+1]...)
+		testPath := pathLib.Join(parts[:i+1]...)
 		if IsRepo(testPath) {
 			return testPath, nil
 		}
@@ -114,10 +177,10 @@ func FindRootRepoPath() (string, error) {
 	return pwd, fmt.Errorf("No .git found in %s or any parent dir.", pwd)
 }
 
-// Get svn info for the repo. Label is the string to the left of the colon in the 
+// Get svn info for the repo. Label is the string to the left of the colon in the
 // standard svn info format. RepoPath must be a git-svn repo.
 func GitSvnInfo(repoPath, label string) (string, error) {
-	out, err := execCmdCombinedOutput(repoPath, "git", "svn", "info")
+	out, err := execCmd(repoPath, "git", "svn", "info")
 	if err != nil {
 		return "", fmt.Errorf("git svn info failed (%s), not a git repo??\n", err)
 	}
@@ -156,7 +219,7 @@ func ReplaceRelative(repoRootUrl, externalRef string) (string, error) {
 }
 
 func GitSvnUrl(repoPath string) (url string, err error) {
-	out, err := execCmdCombinedOutput(repoPath, "git", "svn", "info")
+	out, err := execCmd(repoPath, "git", "svn", "info")
 	if err != nil {
 		return "", err
 	}
@@ -181,7 +244,7 @@ type Repo struct {
 }
 
 func (repo *Repo) LoadExternals() error {
-	rawExternals, err := execCmdCombinedOutput(repo.Path, "git", "svn", "show-externals")
+	rawExternals, err := execCmd(repo.Path, "git", "svn", "show-externals")
 	if err != nil {
 		return err
 	}
@@ -221,7 +284,7 @@ func (repo *Repo) CookExternals(rawExternals string) error {
 				if err != nil {
 					return fmt.Errorf("Error with extern %v\n", err)
 				} else {
-					extPath := path.Join(repo.Path, lastPath[1], match[2])
+					extPath := pathLib.Join(repo.Path, lastPath[1], match[2])
 					repo.Externals = append(repo.Externals,
 						Repo{Path: extPath, Url: svnUrl, Root: repo.Root})
 				}
@@ -275,7 +338,7 @@ func (repo *Repo) ignoreExternalsAddMethod() {
 	}
 
 	var lines [][]byte
-	ignoreFilename := path.Join(repo.Path, ignoreRelPath)
+	ignoreFilename := pathLib.Join(repo.Path, ignoreRelPath)
 	b, err := ioutil.ReadFile(ignoreFilename)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -324,7 +387,7 @@ func (repo *Repo) ignoreExternalsSubtractMethod() {
 		externsToAdd[relPath] = true
 	}
 
-	f, err := os.OpenFile(path.Join(repo.Path, ignoreRelPath),
+	f, err := os.OpenFile(pathLib.Join(repo.Path, ignoreRelPath),
 		os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "IgnoreExternals:", err)
@@ -343,7 +406,7 @@ func (repo *Repo) ignoreExternalsSubtractMethod() {
 		}
 
 		if externsToAdd[ignore] {
-			// The extern is already ignored. 
+			// The extern is already ignored.
 			delete(externsToAdd, ignore)
 		}
 	}
@@ -420,11 +483,11 @@ func (repo *Repo) getCheckoutArgs() []string {
 
 // Check that the repo and its externals are cloned.
 func (repo *Repo) Clone() error {
-	repoPath, repoDir := path.Split(repo.Path)
+	repoPath, repoDir := pathLib.Split(repo.Path)
 
 	if IsRepo(repo.Path) {
 		fmt.Printf("Path %s is a repo, updating from svn.\n", repo.Path)
-		err := execCmd(repo.Path, "git", "svn", "rebase")
+		err := execCmdAttached(repo.Path, "git", "svn", "rebase")
 		if err != nil {
 			return err
 		}
@@ -443,7 +506,7 @@ func (repo *Repo) Clone() error {
 		args := []string{"svn", "clone"}
 		args = append(args, repo.getCheckoutArgs()...)
 		args = append(args, repo.Url, repoDir)
-		err = execCmd(repoPath, "git", args...)
+		err = execCmdAttached(repoPath, "git", args...)
 		if err != nil {
 			return err
 		}
@@ -475,7 +538,7 @@ func (repo *Repo) Clone() error {
 func (repo *Repo) Clean() error {
 	fmt.Fprintln(os.Stderr, "Cleaning repo ", repo.Path)
 
-	toRmStr, err := execCmdCombinedOutput(repo.Path, "git", "clean", "-ndx")
+	toRmStr, err := execCmd(repo.Path, "git", "clean", "-ndx")
 	if err != nil {
 		return err
 	}
@@ -496,7 +559,7 @@ func (repo *Repo) Clean() error {
 			continue
 		}
 
-		qualifiedR := path.Join(repo.Path, r)
+		qualifiedR := pathLib.Join(repo.Path, r)
 
 		if !extMap[r] {
 			if !dryRun {
@@ -520,44 +583,7 @@ func (repo *Repo) Clean() error {
 	return nil
 }
 
-// Load the old-style externals cache into the repo.
-// repo.Path should be initialized beforehand.
-func (repo *Repo) ConvertExternCache() error {
-	fullCachePath := path.Join(repo.Path, oldCachePath)
-	b, err := ioutil.ReadFile(fullCachePath)
-	if err != nil {
-		return err
-	}
-
-	repo.Url, err = GitSvnInfo(repo.Path, "URL")
-	if err != nil {
-		return err
-	}
-
-	buf := bytes.NewBuffer(b)
-	err = repo.CookExternals(buf.String())
-	if err != nil {
-		return err
-	} else {
-		// TODO: why is extern a copy in
-		// for  _, extern := range repo.externals
-		for i := range repo.Externals {
-			err = repo.Externals[i].ConvertExternCache()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "Error converting old cache: ", err)
-			}
-		}
-	}
-
-	err = os.Remove(fullCachePath)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error deleting old cache: ", err)
-	}
-
-	return nil
-}
-
-// If necessary, write the repo configuration to file.
+// Write the repo configuration to file.
 func (repo *Repo) WriteConfig() error {
 	if repo.Root != repo {
 		return repo.Root.WriteConfig()
@@ -568,46 +594,56 @@ func (repo *Repo) WriteConfig() error {
 		return err
 	}
 
-	return ioutil.WriteFile(path.Join(repo.Path, cacheRelPath), b, 0660)
+	if !persistWithGitNotes {
+		return ioutil.WriteFile(pathLib.Join(repo.Path, gishCachePathV2), b, 0660)
+	}
+
+	return GitNoteAdd(repo.Path, b)
 }
 
 // Create a Repo from a config file at the given location.
-// Location can be a path to a git repo or to a config file.
-func LoadConfig(configPath string) (repo *Repo, err error) {
-	isDir := IsDir(configPath)
-	cachePath := configPath
-	if isDir {
-		cachePath = path.Join(configPath, cacheRelPath)
+func LoadConfig(path string) (repo *Repo, err error) {
+	if !IsDir(path) {
+		return nil, fmt.Errorf("Config path is not a directory: %s", path)
 	}
 
-	// Look for new config
-	b, err := ioutil.ReadFile(cachePath)
-	if err == nil {
-		repo = new(Repo)
-		err = json.Unmarshal(b, repo)
-	} else {
-		// Look for old externals cache
-		if isDir {
-			cachePath = path.Join(configPath, oldCachePath)
-		}
-		_, err = os.Stat(cachePath)
-		if err == nil {
-			repo := &Repo{Path: configPath}
-			err = repo.ConvertExternCache()
-		} else {
-			err = fmt.Errorf("No config found in %s", configPath)
+	b, err := ReadConfigV3(path)
+	if err != nil {
+		b, err = ReadConfigV2(path)
+		if err != nil {
+			return nil, fmt.Errorf("Unable to load gish config.")
 		}
 	}
 
-	if repo != nil {
-		repo.LinkRoot()
-	}
+	repo = &Repo{}
+	err = json.Unmarshal(b, repo)
+
+	repo.LinkRoot()
 
 	return repo, err
 }
 
+func ReadConfigV3(path string) ([]byte, error) {
+	// List the notes
+	notedObj, err := GitLookupLatestGishNote(path)
+	if err != nil {
+		return []byte{}, fmt.Errorf("config note lookup: %s", err)
+	}
+
+	b, err := execGishNotes("show", notedObj)
+	if err != nil {
+		err = fmt.Errorf("config note show: %s", err)
+	}
+
+	return b, err
+}
+
+func ReadConfigV2(path string) ([]byte, error) {
+	cachePath := pathLib.Join(path, gishCachePathV2)
+	return ioutil.ReadFile(cachePath)
+}
+
 func NewRepoClone(cmdLineArgs []string) (repo *Repo) {
-	// args are "clone", 
 	flags := flag.NewFlagSet("clone", flag.ExitOnError)
 	altConfig := flags.String("c", "", "Path to config file to use if no other is found.")
 	flags.BoolVar(&askForArgs, "i", false, "Interactively prompt for clone arguments.")
@@ -620,11 +656,14 @@ func NewRepoClone(cmdLineArgs []string) (repo *Repo) {
 
 		fmt.Fprint(os.Stderr, "Options:\n")
 		flags.PrintDefaults()
-	}
 
-	// Clone:
-	// 'gish clone -i https://svn.houston.hp.com/rg0103/tpt-6wind/6WINDGate/trunk'
-	// 'gish clone -c=altpath trunk
+		fmt.Fprintln(os.Stderr, "Example usage:")
+		fmt.Fprintln(os.Stderr, "gish clone -i http://svn.apache.org/repos/asf/spamassassin/trunk sa")
+		fmt.Fprintln(os.Stderr, "\tClone the svn repo into local dir sa, prompting for additional git-svn clone arguments.")
+		fmt.Fprintln(os.Stderr, "\ngish clone -c=altpath trunk")
+		fmt.Fprintln(os.Stderr, "\tClone the repo specified in altpath into directory trunk.")
+
+	}
 
 	// TODO: these aren't supported yet
 	// Update/subclone:
@@ -634,6 +673,29 @@ func NewRepoClone(cmdLineArgs []string) (repo *Repo) {
 
 	// Clone git-svn repo
 	// 'gish clone trunk cloneOfTrunk'
+
+	// ^^
+	//   Is the given url a git repo?
+	//   Is there a gish config file?
+	//   Clone top down.
+
+	//     If the gish config were stored in the repo it could:
+	//        be versioned
+	//        be retrieved remotely
+	/*
+			    $ blob=$(git hash-object -w a.out)
+			   $ git notes --ref=built add -C "$blob" HEAD
+
+			   GIT_NOTES_REF=refs/notes/gish git notes add
+			   GIT_NOTES_REF=refs/notes/gish git notes show
+
+
+			   ----
+			   To clone, do a normal clone then add this to the origin ref and fetch
+			   fetch = +refs/notes/*:refs/notes/*
+
+		       ***this might get rid of the alt-config method
+	*/
 
 	if len(cmdLineArgs) < 2 {
 		UsageExit(flags.Usage, "Not enough arguments to 'gish clone'.")
@@ -655,7 +717,7 @@ func NewRepoClone(cmdLineArgs []string) (repo *Repo) {
 		// This check may not be worth much. Apparently "-i=false" is a valid url.
 		svnUrl, err := url.Parse(strings.TrimSpace(nonFlagArgs[0]))
 		if err != nil {
-			UsageExit(flags.Usage, fmt.Sprint("Error parsing svn Url: %q", err.Error()))
+			UsageExit(flags.Usage, fmt.Sprint("Error parsing svn Url:", err.Error()))
 		}
 
 		var destDir string
@@ -779,14 +841,16 @@ func main() {
 	}
 
 	/* TODO: NewRepo should be integrated into a Command interface then there
-	   is ONE test for the args, then everything else below that that is Command code
-	   has Command context, and any Command context that affects Repo becomes a parameter
+		   is ONE test for the args, then everything else below that that is Command code
+		   has Command context, and any Command context that affects Repo becomes a parameter
 
-	   A command has Flags, minArgs, and an action. 
-	   type Command interface {
-	       Match(args []string) true
+		   A command has Flags, minArgs, and an action.
+		   type Command interface {
+		       Match(args []string) true
 
-	   }
+		   }
+
+	       See $GOROOT/src/cmd/go/main.go:type Command
 	*/
 
 	repo, err := NewRepo(cmdLineArgs)
@@ -812,7 +876,7 @@ func main() {
 		paths := repo.Paths()
 		for _, path := range paths {
 			fmt.Printf("Repo %s:\n", path)
-			err = execCmd(path, "git", cmdLineArgs...)
+			err = execCmdAttached(path, "git", cmdLineArgs...)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "Git returned error:", err)
 				// Don't quit, commands that get paged will return error.
