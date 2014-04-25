@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net/url"
 	"os"
 	"os/exec"
 	pathLib "path"
@@ -32,7 +31,6 @@ const (
 
 var (
 	dryRun, force bool // cmdClean
-	askForArgs    bool // clone
 )
 
 func UsageExit(usage func(), msg string) {
@@ -237,7 +235,6 @@ func GitSvnUrl(repoPath string) (url string, err error) {
 type Repo struct {
 	Path           string
 	Url            string
-	CheckoutArgs   string
 	ExternalsKnown bool
 	Externals      []Repo
 	Root           *Repo `json:"-"` // Don't include in json
@@ -459,57 +456,97 @@ func RewritePaths(repo *Repo, from, to string) {
 	}
 }
 
-func (repo *Repo) getCheckoutArgs() []string {
+func appendCheckoutArgs(args []string, repoUrl string, askForArgs bool) []string {
 	if askForArgs {
-		fmt.Printf("Provide checkout args for %s:\n> ", repo.Url)
-
+		fmt.Printf("Provide checkout args for %s:\n> ", repoUrl)
 		buf := bufio.NewReader(os.Stdin)
 		in, err := buf.ReadString('\n')
 		in = strings.TrimSpace(in)
-		if err == nil {
-			if in != "" {
-				repo.CheckoutArgs = in
-				return strings.Split(repo.CheckoutArgs, " ")
-			}
-		}
-	}
-
-	if repo.CheckoutArgs != "" {
-		return strings.Split(repo.CheckoutArgs, " ")
-	}
-
-	return []string{defaultCheckoutArgs}
-}
-
-// Check that the repo and its externals are cloned.
-func (repo *Repo) Clone() error {
-	repoPath, repoDir := pathLib.Split(repo.Path)
-
-	if IsRepo(repo.Path) {
-		fmt.Printf("Path %s is a repo, updating from svn.\n", repo.Path)
-		err := execCmdAttached(repo.Path, "git", "svn", "rebase")
-		if err != nil {
-			return err
+		if err == nil && in != "" {
+			args = append(args, strings.Split(in, " ")...)
 		}
 	} else {
-		if IsDir(repo.Path) {
-			fmt.Fprintf(os.Stderr, "Path %s exists but is not a repo.\n", repo.Path)
-			os.Exit(1)
-		}
+		args = append(args, strings.Split(defaultCheckoutArgs, " ")...)
+	}
 
-		fmt.Printf("Cloning %q from svn url %q\n", repo.Path, repo.Url)
-		err := os.MkdirAll(repo.Path, 0770)
-		if err != nil {
-			return err
-		}
+	return args
+}
 
-		args := []string{"svn", "clone"}
-		args = append(args, repo.getCheckoutArgs()...)
-		args = append(args, repo.Url, repoDir)
-		err = execCmdAttached(repoPath, "git", args...)
+func gitClone(gitSrc, destDir string, askForArgs bool) (repo *Repo, err error) {
+	err = os.MkdirAll(destDir, 0770)
+	if err != nil {
+		err = fmt.Errorf("Creating %s: %s", destDir, err)
+		return
+	}
+
+	cmds := [][]string{
+		[]string{"git init"},
+		[]string{strings.Join([]string{"git remote add origin", gitSrc}, " ")},
+		[]string{"git config --replace-all remote.origin.fetch"},
+		[]string{"git config --add remote.origin.fetch +refs/notes/*:refs/notes/*"},
+		[]string{"git fetch}"},
+		[]string{"git config --remote-section remote.origin"},
+		[]string{"git checkout -b master FETCH_HEAD"},
+	}
+
+	for _, cmd := range cmds {
+		err = execCmdAttached(destDir, cmd[0], cmd[1:]...)
 		if err != nil {
-			return err
+			os.RemoveAll(destDir)
+			err = fmt.Errorf("%s: %s", strings.Join(cmd, " "), err)
+			return
 		}
+	}
+
+	repo, err = LoadConfig(destDir)
+	if err != nil {
+		// TODO: generate a config instead of erroring.
+		err = fmt.Errorf("%s\nError loading gish config for cloned repo %s. Clone incomplete.", err, destDir)
+		return
+	}
+
+	bork
+	// The git clone process has to be done for each repo, though the config step only happens for the top one.
+
+	// "git svn init", svnSrc}, " ")},
+	for _, cmd := range cmds {
+		err = execCmdAttached(destDir, cmd[0], cmd[1:]...)
+		if err != nil {
+			os.RemoveAll(destDir)
+			err = fmt.Errorf("%s: %s", strings.Join(cmd, " "), err)
+			return
+		}
+	}
+
+	repo.Foreach([]string{"svn", "rebase"})
+}
+
+func svnClone(svnSrc, destDir string, askForArgs bool) (*Repo, error) {
+	repo := &Repo{Path: destDir, Url: svnSrc}
+	// The root member of the root repo points to itself.
+	// Code can always jump through the root pointer to get to the root.
+	// Recursive code will have to test or have separate initial/root functions.
+	repo.Root = repo
+
+	err := repo.SvnClone(askForArgs)
+	return repo, err
+}
+
+func (repo *Repo) SvnClone(askForArgs bool) error {
+	repoPath, repoDir := pathLib.Split(repo.Path)
+
+	fmt.Printf("Cloning %q from svn url %q\n", repo.Path, repo.Url)
+	err := os.MkdirAll(repo.Path, 0770)
+	if err != nil {
+		return err
+	}
+
+	args := []string{"svn", "clone"}
+	args = appendCheckoutArgs(args, repo.Url, askForArgs)
+	args = append(args, repo.Url, repoDir)
+	err = execCmdAttached(repoPath, "git", args...)
+	if err != nil {
+		return err
 	}
 
 	if !repo.ExternalsKnown {
@@ -525,7 +562,7 @@ func (repo *Repo) Clone() error {
 	repo.WriteConfig()
 
 	for i := range repo.Externals {
-		err := repo.Externals[i].Clone()
+		err := repo.Externals[i].SvnClone(askForArgs)
 		if err != nil {
 			return err
 		}
@@ -581,6 +618,18 @@ func (repo *Repo) Clean() error {
 	}
 
 	return nil
+}
+
+func (repo *Repo) Foreach(cmdLineArgs []string) error {
+	paths := repo.Paths()
+	for _, path := range paths {
+		fmt.Printf("Repo %s:\n", path)
+		err := execCmdAttached(path, "git", cmdLineArgs...)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Git returned error:", err)
+			// Don't quit, commands that get paged will return error.
+		}
+	}
 }
 
 // Write the repo configuration to file.
@@ -643,28 +692,22 @@ func ReadConfigV2(path string) ([]byte, error) {
 	return ioutil.ReadFile(cachePath)
 }
 
-func NewRepoClone(cmdLineArgs []string) (repo *Repo) {
+func Clone(cloneArgs []string) (*Repo, error) {
 	flags := flag.NewFlagSet("clone", flag.ExitOnError)
-	altConfig := flags.String("c", "", "Path to config file to use if no other is found.")
+	var svnSrc string
+	var askForArgs bool
+	flags.StringVar(&svnSrc, "s", "", "URL to svn repo that will be cloned.")
 	flags.BoolVar(&askForArgs, "i", false, "Interactively prompt for clone arguments.")
 	flags.Usage = func() {
-		fmt.Fprint(os.Stderr, "usage:\n\tgish clone [-c=<cfgpath> | svnUrl] [destDir]\n")
-		fmt.Fprint(os.Stderr, "\tStandard usage is 'gish clone <svnUrl> [destDir]'\n")
-		fmt.Fprint(os.Stderr, "\tIf a path to a gish config file (or repo containing one) is provided,\n")
-		fmt.Fprint(os.Stderr, "\tGish will use the url, externals, etc from that config.\n")
+		fmt.Fprint(os.Stderr, "usage:\n\tgish clone [-i] [-s=svnUrl | gitUrl] <destDir>\n")
+		fmt.Fprint(os.Stderr, "\tClone the repo at the path or url svnUrl or gitUrl into destDir.\n")
 		fmt.Fprintf(os.Stderr, "\tThe default clone arguments are '%s'\n", defaultCheckoutArgs)
 
 		fmt.Fprint(os.Stderr, "Options:\n")
 		flags.PrintDefaults()
-
-		fmt.Fprintln(os.Stderr, "Example usage:")
-		fmt.Fprintln(os.Stderr, "gish clone -i http://svn.apache.org/repos/asf/spamassassin/trunk sa")
-		fmt.Fprintln(os.Stderr, "\tClone the svn repo into local dir sa, prompting for additional git-svn clone arguments.")
-		fmt.Fprintln(os.Stderr, "\ngish clone -c=altpath trunk")
-		fmt.Fprintln(os.Stderr, "\tClone the repo specified in altpath into directory trunk.")
-
 	}
 
+	// DELME
 	// TODO: these aren't supported yet
 	// Update/subclone:
 	// 'gish clone' in a repo
@@ -683,98 +726,86 @@ func NewRepoClone(cmdLineArgs []string) (repo *Repo) {
 	//        be versioned
 	//        be retrieved remotely
 	/*
-			    $ blob=$(git hash-object -w a.out)
-			   $ git notes --ref=built add -C "$blob" HEAD
+	   $ blob=$(git hash-object -w a.out)
+	   $ git notes --ref=built add -C "$blob" HEAD
 
-			   GIT_NOTES_REF=refs/notes/gish git notes add
-			   GIT_NOTES_REF=refs/notes/gish git notes show
+	   GIT_NOTES_REF=refs/notes/gish git notes add
+	   GIT_NOTES_REF=refs/notes/gish git notes show
 
 
-			   ----
-			   To clone, do a normal clone then add this to the origin ref and fetch
-			   fetch = +refs/notes/*:refs/notes/*
+	   ----
+	   To clone, do a normal clone then add this to the origin ref and fetch
+	   fetch = +refs/notes/*:refs/notes/*
 
-		       ***this might get rid of the alt-config method
+	   ***this might get rid of the alt-config method
 	*/
 
-	if len(cmdLineArgs) < 2 {
-		UsageExit(flags.Usage, "Not enough arguments to 'gish clone'.")
-	}
+	/*
+	   if len(cmdLineArgs) < 2 {
+	       UsageExit(flags.Usage, "Not enough arguments to 'gish clone'.")
+	   }
+	*/
 
-	flags.Parse(cmdLineArgs[1:])
-
+	flags.Parse(cloneArgs)
 	nonFlagArgs := flags.Args()
-	// Clone can be used three ways, two are handled here
-	if *altConfig == "" {
-		// SVN URL required
-		if len(nonFlagArgs) < 1 {
-			UsageExit(flags.Usage, "Not enough arguments to 'gish clone'. SVN URL required")
-		} else if len(nonFlagArgs) > 2 {
-			UsageExit(flags.Usage, "Too many arguments.")
-		}
 
-		// Fill in the url provided, clone will fill the rest
-		// This check may not be worth much. Apparently "-i=false" is a valid url.
-		svnUrl, err := url.Parse(strings.TrimSpace(nonFlagArgs[0]))
-		if err != nil {
-			UsageExit(flags.Usage, fmt.Sprint("Error parsing svn Url:", err.Error()))
-		}
+	var srcUrl string
+	var destDir string
 
-		var destDir string
-		if len(nonFlagArgs) == 2 {
-			destDir = nonFlagArgs[1]
+	if len(nonFlagArgs) < 1 {
+		UsageExit(flags.Usage, "Not enough arguments to 'gish clone'.")
+	} else if len(nonFlagArgs) == 1 {
+		if svnSrc == "" {
+			UsageExit(flags.Usage, "Provide source repo and destDir.")
 		} else {
-			pathParts := strings.Split(svnUrl.Path, "/")
-			destDir = pathParts[len(pathParts)-1]
+			srcUrl = svnSrc
+			destDir = strings.TrimSpace(nonFlagArgs[0])
 		}
-
-		absDestDir, err := filepath.Abs(destDir)
-		if err != nil {
-			UsageExit(flags.Usage, fmt.Sprintf("invalid destdir %s: %v", destDir, err))
+	} else if len(nonFlagArgs) == 2 {
+		if svnSrc != "" {
+			UsageExit(flags.Usage, "Provide only one source repo url.")
+		} else {
+			srcUrl = strings.TrimSpace(nonFlagArgs[0])
+			destDir = strings.TrimSpace(nonFlagArgs[1])
 		}
-
-		repo = &Repo{Path: absDestDir, Url: svnUrl.String()}
-	} else {
-		/* TODO: If the alt-config was a path to an existing git-svn repo, we could
-				   clone it rather than going to the server.
-		           Same action if nonFlagArgs[0] is a local path... unless svn repos can be accessed locally.
-		*/
-
-		// DestDir required
-		if len(nonFlagArgs) < 1 {
-			UsageExit(flags.Usage, "Not enough arguments to 'gish clone'. Destination dir required")
-		} else if len(nonFlagArgs) > 1 {
-			UsageExit(flags.Usage, "Too many arguments.")
-		}
-
-		destDir, err := filepath.Abs(nonFlagArgs[0])
-		if err != nil {
-			UsageExit(flags.Usage, fmt.Sprintf("invalid destdir %s: %v", nonFlagArgs[0], err))
-		}
-
-		repo, err = LoadConfig(*altConfig)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Provided alternate config is invalid: ", err.Error())
-			os.Exit(1)
-		}
-
-		RewritePaths(repo, repo.Path, destDir)
 	}
 
-	return repo
+	absDestDir, err := filepath.Abs(destDir)
+	if err != nil {
+		UsageExit(flags.Usage, fmt.Sprintf("invalid destdir %s: %v", destDir, err))
+	}
+	_, err = os.Stat(absDestDir)
+	if err == nil {
+		UsageExit(flags.Usage, "destDir exists")
+	}
+
+	// DELME
+	/*
+	   // Fill in the url provided, clone will fill the rest
+	   // This check may not be worth much. Apparently "-i=false" is a valid url.
+	   svnUrl, err := url.Parse(strings.TrimSpace(nonFlagArgs[0]))
+	   if err != nil {
+	       UsageExit(flags.Usage, fmt.Sprint("Error parsing svn Url:", err.Error()))
+	   }
+
+	   var destDir string
+	   if len(nonFlagArgs) == 2 {
+	       destDir = nonFlagArgs[1]
+	   } else {
+	       pathParts := strings.Split(svnUrl.Path, "/")
+	       destDir = pathParts[len(pathParts)-1]
+	   }
+	*/
+
+	if svnSrc == "" {
+		return gitClone(srcUrl, absDestDir, askForArgs)
+	} else {
+		return svnClone(srcUrl, absDestDir, askForArgs)
+	}
+
 }
 
 func NewRepo(cmdLineArgs []string) (*Repo, error) {
-	if cmdLineArgs[0] == "clone" {
-		repo := NewRepoClone(cmdLineArgs)
-		// The root member of the root repo points to itself.
-		// Code can always jump through the root pointer to get to the root.
-		// Recursive code will have to test or have separate initial/root functions.
-		repo.Root = repo
-
-		return repo, nil
-	}
-
 	rootPath, err := FindRootRepoPath()
 	if err != nil {
 		return nil, err
@@ -840,47 +871,31 @@ func main() {
 		UsageExit(Usage, "No command provided.")
 	}
 
-	/* TODO: NewRepo should be integrated into a Command interface then there
-		   is ONE test for the args, then everything else below that that is Command code
-		   has Command context, and any Command context that affects Repo becomes a parameter
+	var repo *Repo
+	var err error
 
-		   A command has Flags, minArgs, and an action.
-		   type Command interface {
-		       Match(args []string) true
-
-		   }
-
-	       See $GOROOT/src/cmd/go/main.go:type Command
-	*/
-
-	repo, err := NewRepo(cmdLineArgs)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-
-	switch cmdLineArgs[0] {
-	case "clone":
-		err = repo.Clone()
-		if err != nil { // Skip the config write. Clone() writes config for each successful clone.
+	if cmdLineArgs[0] == "clone" {
+		repo, err = Clone(cmdLineArgs[1:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error cloning:", err)
+			os.Exit(1)
+		}
+	} else {
+		repo, err = NewRepo(cmdLineArgs)
+		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-	case "list":
-		repo.List()
-	case "clean":
-		cmdClean(cmdLineArgs, repo)
-	case "updateignores":
-		repo.IgnoreAllExternals()
-	default:
-		paths := repo.Paths()
-		for _, path := range paths {
-			fmt.Printf("Repo %s:\n", path)
-			err = execCmdAttached(path, "git", cmdLineArgs...)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "Git returned error:", err)
-				// Don't quit, commands that get paged will return error.
-			}
+
+		switch cmdLineArgs[0] {
+		case "list":
+			repo.List()
+		case "clean":
+			cmdClean(cmdLineArgs, repo)
+		case "updateignores":
+			repo.IgnoreAllExternals()
+		default:
+			repo.Foreach(cmdLineArgs)
 		}
 	}
 
@@ -888,4 +903,5 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error writing config: ", err)
 	}
+
 }
